@@ -417,11 +417,12 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38; \
     fi
 
-# Persist checkout-agnostic native provenance in the image. The Buildkite
-# trace wrapper stamps it with the exact repository SHA and timestamp when it
-# publishes the artifacts. A precompiled build intentionally has no File API
-# reply and therefore no build-graph.jsonl: the shadow trace step detects and
-# reports that incomplete evidence instead of publishing a misleading graph.
+# Persist checkout-agnostic native provenance in the image. Image-build
+# publishes these exact bytes once with a separate SHA/repository manifest;
+# traced test jobs reference those hashes rather than copying the maps. A
+# precompiled build intentionally has no File API reply and therefore no
+# build-graph.jsonl: the shadow trace step detects and reports that incomplete
+# evidence instead of publishing a misleading graph.
 RUN set -eu; \
     mkdir -p /opt/vllm-ci/build-graph; \
     reply_dir="$(find build -type d -path '*/.cmake/api/v1/reply' -print -quit 2>/dev/null || true)"; \
@@ -439,8 +440,17 @@ RUN set -eu; \
         python3 tools/ci_test_selection/extract_kernel_symbols.py \
             "$(find dist -maxdepth 1 -name '*.whl' -print -quit)" \
             --out /opt/vllm-ci/build-graph/kernel-map.jsonl; \
+        python3 tools/ci_test_selection/extract_object_kernel_symbols.py \
+            "$build_dir" --source-root /workspace \
+            --ninja-deps /tmp/ninja-deps.txt \
+            --build-graph /tmp/native-build-graph.jsonl \
+            --out /tmp/object-kernel-map.jsonl \
+            2> /tmp/object-kernel-map-summary.json; \
+        python3 -c 'import json; d=json.load(open("/tmp/object-kernel-map-summary.json")); assert d.get("kernel_objects", 0) > 0, d; assert d.get("translation_unit_kernel_edges", 0) > 0, d'; \
+        cat /tmp/object-kernel-map-summary.json; \
         cat /tmp/native-build-graph.jsonl \
             /opt/vllm-ci/build-graph/kernel-map.jsonl \
+            /tmp/object-kernel-map.jsonl \
             > /opt/vllm-ci/build-graph/build-graph.jsonl; \
         test -s /opt/vllm-ci/build-graph/build-graph.jsonl; \
         python3 tools/ci_test_selection/validate_build_graph.py \

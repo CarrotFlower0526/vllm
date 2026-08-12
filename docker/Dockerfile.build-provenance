@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1.7
+
+# Export only the immutable static maps from the exact test image. BuildKit
+# fetches the small layer containing these files; it does not need to pull and
+# unpack the entire multi-gigabyte image on the image-build agent.
+ARG SOURCE_IMAGE
+FROM ${SOURCE_IMAGE} AS source
+
+FROM scratch
+COPY --from=source /opt/vllm-ci/build-graph/build-graph.jsonl /
+COPY --from=source /opt/vllm-ci/build-graph/kernel-map.jsonl /

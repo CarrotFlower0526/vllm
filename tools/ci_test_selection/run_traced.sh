@@ -44,7 +44,7 @@ mkdir -p "$OUT_DIR"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_GRAPH_DIR="${BUILD_GRAPH_DIR:-/opt/vllm-ci/build-graph}"
 KERNEL_MAP="${KERNEL_MAP:-$BUILD_GRAPH_DIR/kernel-map.jsonl}"
-PUBLISH_BUILD_GRAPH="${PUBLISH_BUILD_GRAPH:-1}"
+PUBLISH_BUILD_GRAPH="${PUBLISH_BUILD_GRAPH:-0}"
 DEEP_TRACE="${VLLM_CI_TEST_SELECTION_DEEP_TRACE:-0}"
 
 for name in build-graph.jsonl kernel-map.jsonl; do
@@ -81,7 +81,7 @@ profile_options=(
 if [[ "$DEEP_TRACE" == "1" ]]; then
     profile_options=(
         --trace=cuda,nvtx --sample=process-tree --cpuctxsw=none
-        --backtrace=dwarf --cudabacktrace=kernel --python-backtrace=cuda
+        --backtrace=dwarf --cudabacktrace=kernel:0 --python-backtrace=cuda
         --pytorch=functions-trace,autograd-nvtx
         --trace-fork-before-exec=true
     )
@@ -98,7 +98,8 @@ traced_seconds=$(( $(date +%s) - traced_start ))
 parse_status=0
 if [[ -s "$OUT_DIR/trace.nsys-rep" ]]; then
     set +e
-    nsys export --type sqlite --output "$OUT_DIR/trace.sqlite" \
+    nsys export --type sqlite --include-json true \
+        --output "$OUT_DIR/trace.sqlite" \
         --force-overwrite=true "$OUT_DIR/trace.nsys-rep"
     export_status=$?
     if (( export_status == 0 )); then
@@ -130,17 +131,11 @@ else
         "$profile_status" > "$OUT_DIR/join-rate-summary.json"
 fi
 
-# wrapper-owned provenance stamps on the canonical artifact (pipeline
-# context only; local runs without BUILDKITE_COMMIT skip the stamp)
+# Runtime edge rows are stamped here. Static build-graph/kernel-map files are
+# immutable image-build artifacts and are referenced by SHA-256 from
+# trace-job.json rather than copied into every test job.
 if [[ -n "${BUILDKITE_COMMIT:-}" ]]; then
     created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    for name in build-graph.jsonl kernel-map.jsonl; do
-        if [[ -s "$OUT_DIR/$name" ]]; then
-            python3 "$HERE/stamp_jsonl.py" "$OUT_DIR/$name" \
-                --repository-sha "$BUILDKITE_COMMIT" \
-                --created-at "$created_at"
-        fi
-    done
     if [[ -s "$OUT_DIR/gpu-trace.jsonl" ]]; then
         python3 "$HERE/stamp_jsonl.py" "$OUT_DIR/gpu-trace.jsonl" \
             --repository-sha "$BUILDKITE_COMMIT" \

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import sqlite3
 import tempfile
@@ -135,6 +136,62 @@ def _load_callchains(
     return dict(chains)
 
 
+def _load_python_backtraces(
+    connection: sqlite3.Connection, strings: dict[int, str]
+) -> dict[tuple[int, int], list[dict[str, Any]]]:
+    """Load Nsight's launch-time Python stacks from NVTX JSON payloads.
+
+    With ``nsys export --include-json true``, ``--python-backtrace=cuda``
+    emits one point event at the exact CUDA runtime launch timestamp. The
+    function and file values in each frame are StringIds references.
+    """
+
+    columns = _columns(connection, "NVTX_EVENTS")
+    required = {"start", "globalTid", "jsonText"}
+    if not required <= columns:
+        return {}
+
+    traces: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for start, global_tid, json_text in connection.execute(
+        "SELECT start, globalTid, jsonText FROM NVTX_EVENTS WHERE jsonText IS NOT NULL"
+    ):
+        try:
+            document = json.loads(json_text)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        payload = document.get("Python Backtrace on CUDA")
+        if not isinstance(payload, dict):
+            continue
+        raw_frames = payload.get("Frames")
+        if not isinstance(raw_frames, list):
+            continue
+        declared_count = payload.get("Frames count")
+        if not isinstance(declared_count, int) or declared_count != len(raw_frames):
+            raise SystemExit(
+                "Python CUDA backtrace frame count disagrees with its payload"
+            )
+        frames = []
+        for depth, raw in enumerate(raw_frames):
+            if not isinstance(raw, dict):
+                continue
+            function = _resolved(raw.get("Function"), strings)
+            filename = _resolved(raw.get("File"), strings)
+            frame = {
+                "depth": depth,
+                "file": html.unescape(filename) if filename else None,
+                "function": html.unescape(function) if function else None,
+                "line": raw.get("Line"),
+            }
+            frames.append(frame)
+        key = (int(global_tid), int(start))
+        if key in traces and traces[key] != frames:
+            raise SystemExit(
+                "conflicting Python CUDA backtraces at one thread/timestamp"
+            )
+        traces[key] = frames
+    return traces
+
+
 def _load_artifacts(path: Path | None) -> dict[str, set[str]]:
     artifacts: dict[str, set[str]] = defaultdict(set)
     if path is None:
@@ -152,11 +209,12 @@ def _load_artifacts(path: Path | None) -> dict[str, set[str]]:
 
 def _load_build_provenance(
     path: Path | None,
-) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+) -> tuple[dict[str, set[str]], dict[str, set[str]], dict[str, set[str]]]:
     targets: dict[str, set[str]] = defaultdict(set)
     files: dict[str, set[str]] = defaultdict(set)
+    translation_units: dict[str, set[str]] = defaultdict(set)
     if path is None:
-        return targets, files
+        return targets, files, translation_units
     with path.open(encoding="utf-8") as stream:
         for line in stream:
             row = json.loads(line)
@@ -170,7 +228,13 @@ def _load_build_provenance(
                 and row.get("destination_kind") == "target"
             ):
                 files[row["destination"]].add(row["source"])
-    return targets, files
+            elif (
+                row.get("source_kind") == "file"
+                and row.get("edge_kind") == "compiles_kernel"
+                and row.get("destination_kind") == "kernel"
+            ):
+                translation_units[row["destination"]].add(row["source"])
+    return targets, files, translation_units
 
 
 def _atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -225,7 +289,9 @@ def export_deep_trace(
 
         temporal = _temporal_attributions(test_ranges, launches)
         callchains = _load_callchains(connection, strings)
+        python_backtraces = _load_python_backtraces(connection, strings)
         artifacts_by_kernel = _load_artifacts(kernel_map)
+        _, _, translation_units_by_kernel = _load_build_provenance(build_graph)
 
         kernel_columns = _columns(connection, "CUPTI_ACTIVITY_KIND_KERNEL")
         if "mangledName" not in kernel_columns:
@@ -293,6 +359,9 @@ def export_deep_trace(
                 if callchain_id is not None
                 else []
             )
+            python_backtrace = python_backtraces.get(
+                (int(launch["global_tid"]), timestamp), []
+            )
             artifacts = sorted(artifacts_by_kernel.get(kernel or "", set()))
             rows.append(
                 {
@@ -323,7 +392,11 @@ def export_deep_trace(
                     "launch_start_ns": timestamp,
                     "phase": phase,
                     "process_key": launch["process_key"],
+                    "python_backtrace": python_backtrace,
                     "test_id": node_id,
+                    "translation_units": sorted(
+                        translation_units_by_kernel.get(kernel or "", set())
+                    ),
                 }
             )
     finally:
@@ -340,7 +413,9 @@ def export_deep_trace(
     for index, row in enumerate(rows):
         row["launch_index"] = index
 
-    targets_by_artifact, files_by_target = _load_build_provenance(build_graph)
+    targets_by_artifact, files_by_target, translation_units_by_kernel = (
+        _load_build_provenance(build_graph)
+    )
     provenance = []
     kernels = {row["kernel_mangled"] for row in rows if row["kernel_mangled"]}
     for kernel in sorted(kernels):
@@ -355,7 +430,15 @@ def export_deep_trace(
                     }
                 )
             artifact_rows.append({"artifact": artifact, "targets": target_rows})
-        provenance.append({"artifacts": artifact_rows, "kernel_mangled": kernel})
+        provenance.append(
+            {
+                "artifacts": artifact_rows,
+                "kernel_mangled": kernel,
+                "translation_units": sorted(
+                    translation_units_by_kernel.get(kernel, set())
+                ),
+            }
+        )
 
     python_frames = sum(
         any(
@@ -372,12 +455,24 @@ def export_deep_trace(
         "job_key": job_key,
         "kernel_launch_rows": len(rows),
         "python_callchain_hint_rate": python_frames / len(rows) if rows else 0,
+        "python_backtrace_frames": sum(len(row["python_backtrace"]) for row in rows),
+        "python_backtrace_launches": sum(bool(row["python_backtrace"]) for row in rows),
+        "python_backtrace_rate": (
+            sum(bool(row["python_backtrace"]) for row in rows) / len(rows)
+            if rows
+            else 0
+        ),
         "runtime_alias_rows_deduplicated": runtime_aliases,
         "static_join_rate": (
             sum(bool(row["artifacts"]) for row in rows) / len(rows) if rows else 0
         ),
         "test_attribution_rate": (
             sum(row["test_id"] is not None for row in rows) / len(rows) if rows else 0
+        ),
+        "translation_unit_join_rate": (
+            sum(bool(row["translation_units"]) for row in rows) / len(rows)
+            if rows
+            else 0
         ),
         "unique_kernels": len(provenance),
     }
@@ -411,6 +506,11 @@ def main() -> int:
         raise SystemExit("deep trace contained no correlated CUDA kernel launches")
     if not any(row["cuda_callchain"] for row in rows):
         raise SystemExit("deep trace contained no CUDA launch callchains")
+    if not any(row["python_backtrace"] for row in rows):
+        raise SystemExit(
+            "deep trace contained no Python CUDA backtraces; "
+            "was nsys export run with --include-json true?"
+        )
     if not any(row["test_id"] for row in rows):
         raise SystemExit("deep trace contained no test-attributed CUDA launches")
     return 0

@@ -20,6 +20,8 @@ import pybase64 as base64
 
 from . import COLLECTOR_VERSION
 
+STATIC_BUILD_PROVENANCE_FILES = ("build-graph.jsonl", "kernel-map.jsonl")
+
 
 def _atomic_json(path: Path, document: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -28,6 +30,40 @@ def _atomic_json(path: Path, document: Any) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def static_build_provenance_reference(
+    directory: Path,
+) -> dict[str, Any] | None:
+    paths = [directory / name for name in STATIC_BUILD_PROVENANCE_FILES]
+    if not any(path.is_file() for path in paths):
+        return None
+    missing = [
+        path.name for path in paths if not path.is_file() or not path.stat().st_size
+    ]
+    if missing:
+        raise SystemExit(
+            "incomplete image-build provenance: " + ", ".join(sorted(missing))
+        )
+    return {
+        "buildkite_build_id": os.environ.get("BUILDKITE_BUILD_ID"),
+        "files": {
+            path.name: {"bytes": path.stat().st_size, "sha256": _sha256(path)}
+            for path in paths
+        },
+        "kind": "static-build-provenance-reference",
+        "publisher_step_key": "image-build",
+        "repository_sha": os.environ.get("BUILDKITE_COMMIT"),
+        "schema_version": 1,
+    }
 
 
 def decode_commands(value: str) -> list[str]:
@@ -50,6 +86,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--represented-job-key", required=True)
     parser.add_argument("--commands-base64", required=True)
     parser.add_argument("--repo-root", type=Path, default=Path("/vllm-workspace"))
+    parser.add_argument(
+        "--build-graph-dir",
+        type=Path,
+        default=Path("/opt/vllm-ci/build-graph"),
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--capture-gpu", action="store_true")
     mode.add_argument("--deep-gpu", action="store_true")
@@ -98,7 +139,7 @@ def _run_command(
     environment["VLLM_CI_TEST_SELECTION_DEEP_TRACE"] = "1" if deep_gpu else "0"
     if capture_gpu:
         wrapper = Path(__file__).with_name("run_traced.sh")
-        environment["PUBLISH_BUILD_GRAPH"] = "1" if command_index == 0 else "0"
+        environment["PUBLISH_BUILD_GRAPH"] = "0"
         runner = [
             str(wrapper),
             str(shard_dir),
@@ -188,6 +229,9 @@ def main() -> int:
             "healthy": healthy,
             "job_key": args.job_key,
             "represented_job_key": args.represented_job_key,
+            "static_build_provenance": static_build_provenance_reference(
+                args.build_graph_dir
+            ),
         },
     )
     upload_status = _upload_artifacts(artifact_pattern)

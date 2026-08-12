@@ -12,7 +12,12 @@ import tempfile
 import unittest
 from unittest import mock
 
-from tools.ci_test_selection import export_build_graph, extract_kernel_symbols
+from tools.ci_test_selection import (
+    export_build_graph,
+    extract_kernel_symbols,
+    extract_object_kernel_symbols,
+    write_build_provenance_manifest,
+)
 
 HERE = pathlib.Path(__file__).resolve().parent
 SCRIPT_DIR = HERE.parents[2] / "tools/ci_test_selection"
@@ -152,6 +157,84 @@ class TestExport(unittest.TestCase):
 
         self.assertEqual(row["source"], identity)
         self.assertEqual(row["artifact_build_id"], build_id)
+
+    def test_object_kernel_exporter_retains_exact_translation_unit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            source_root = base / "src"
+            build_dir = base / "build"
+            source = source_root / "csrc/ops.cu"
+            included_cu = source_root / "csrc/included_impl.cu"
+            object_path = build_dir / "CMakeFiles/_C.dir/csrc/ops.cu.o"
+            source.parent.mkdir(parents=True)
+            object_path.parent.mkdir(parents=True)
+            source.write_text("// source\n")
+            included_cu.write_text("// included implementation\n")
+            object_path.write_bytes(b"object fixture")
+            rules = {
+                str(object_path.relative_to(build_dir)): [
+                    str(source),
+                    str(included_cu),
+                ]
+            }
+
+            with mock.patch.object(
+                extract_object_kernel_symbols,
+                "kernel_names",
+                return_value={"_ZexactKernel"},
+            ):
+                rows, summary = (
+                    extract_object_kernel_symbols.export_object_kernel_edges(
+                        build_dir,
+                        source_root,
+                        rules,
+                        {("csrc/ops.cu", "_C")},
+                    )
+                )
+
+        self.assertEqual(
+            rows,
+            [
+                {
+                    "source_kind": "file",
+                    "source": "csrc/ops.cu",
+                    "edge_kind": "compiles_kernel",
+                    "destination_kind": "kernel",
+                    "destination": "_ZexactKernel",
+                    "target": "_C",
+                    "object_path": "CMakeFiles/_C.dir/csrc/ops.cu.o",
+                }
+            ],
+        )
+        self.assertEqual(summary["kernel_objects"], 1)
+        self.assertEqual(summary["translation_unit_kernel_edges"], 1)
+        self.assertEqual(summary["unique_translation_units"], 1)
+
+    def test_static_manifest_hashes_the_exact_image_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            (directory / "build-graph.jsonl").write_text('{"graph":1}\n')
+            (directory / "kernel-map.jsonl").write_text('{"kernel":1}\n')
+            document = write_build_provenance_manifest.build_manifest(
+                directory,
+                repository_sha="a" * 40,
+                image_tag="registry/vllm:test",
+                image_digest="sha256:" + "c" * 64,
+                created_at="2026-08-12T23:00:00Z",
+                buildkite_build_id="build-id",
+            )
+
+        self.assertEqual(document["publisher_step_key"], "image-build")
+        self.assertEqual(document["repository_sha"], "a" * 40)
+        self.assertEqual(document["image_tag"], "registry/vllm:test")
+        self.assertEqual(document["image_digest"], "sha256:" + "c" * 64)
+        self.assertEqual(
+            document["files"]["build-graph.jsonl"]["bytes"],
+            len('{"graph":1}\n'),
+        )
+        self.assertRegex(
+            document["files"]["kernel-map.jsonl"]["sha256"], r"^[0-9a-f]{64}$"
+        )
 
 
 if __name__ == "__main__":

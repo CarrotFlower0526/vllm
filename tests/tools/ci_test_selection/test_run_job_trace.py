@@ -12,7 +12,10 @@ import pybase64 as base64
 import pytest
 
 from tools.ci_test_selection.nvtx_test_ranges import _configured_nvtx
-from tools.ci_test_selection.run_job_trace import decode_commands
+from tools.ci_test_selection.run_job_trace import (
+    decode_commands,
+    static_build_provenance_reference,
+)
 
 
 def _payload(commands: list[str]) -> str:
@@ -23,6 +26,25 @@ def test_decode_commands_round_trip():
     commands = ["pytest -q tests/test_one.py", "python -m pytest tests/test_two.py"]
 
     assert decode_commands(_payload(commands)) == commands
+
+
+def test_static_build_provenance_reference_uses_image_file_hashes(
+    tmp_path: Path, monkeypatch
+):
+    graph_dir = tmp_path / "build-graph"
+    graph_dir.mkdir()
+    (graph_dir / "build-graph.jsonl").write_text('{"graph":1}\n')
+    (graph_dir / "kernel-map.jsonl").write_text('{"kernel":1}\n')
+    monkeypatch.setenv("BUILDKITE_COMMIT", "b" * 40)
+    monkeypatch.setenv("BUILDKITE_BUILD_ID", "build-id")
+
+    reference = static_build_provenance_reference(graph_dir)
+
+    assert reference["publisher_step_key"] == "image-build"
+    assert reference["repository_sha"] == "b" * 40
+    assert reference["buildkite_build_id"] == "build-id"
+    assert reference["files"]["build-graph.jsonl"]["bytes"] > 0
+    assert len(reference["files"]["kernel-map.jsonl"]["sha256"]) == 64
 
 
 def test_top_level_collector_package_avoids_tests_tools_shadowing():

@@ -85,16 +85,52 @@ annotate_image_tags() {
 }
 
 check_and_skip_if_image_exists() {
+    IMAGE_ALREADY_EXISTS=0
     if [[ -n "${IMAGE_TAG:-}" ]]; then
         echo "--- :mag: Checking if image exists"
         if docker manifest inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
             echo "Image already exists: ${IMAGE_TAG}"
             echo "Skipping build"
-            annotate_image_tags
-            exit 0
+            IMAGE_ALREADY_EXISTS=1
+            return
         fi
         echo "Image not found, proceeding with build"
     fi
+}
+
+publish_build_provenance() {
+    if [[ "${VLLM_CI_PUBLISH_BUILD_PROVENANCE:-0}" != "1" ]]; then
+        return
+    fi
+    echo "--- :arrow_down: Publishing immutable build provenance"
+    local provenance_tmp provenance_dir created_at image_digest
+    provenance_tmp="$(mktemp -d)"
+    provenance_dir="${provenance_tmp}/ci-build-provenance"
+    mkdir -p "${provenance_dir}"
+    docker buildx build \
+        --file docker/Dockerfile.build-provenance \
+        --build-arg "SOURCE_IMAGE=${IMAGE_TAG}" \
+        --output "type=local,dest=${provenance_dir}" \
+        .
+    test -s "${provenance_dir}/build-graph.jsonl"
+    test -s "${provenance_dir}/kernel-map.jsonl"
+    image_digest="$(docker buildx imagetools inspect "${IMAGE_TAG}" \
+        --format '{{.Manifest.Digest}}')"
+    if [[ ! "${image_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        echo "Invalid image digest for ${IMAGE_TAG}: ${image_digest}" >&2
+        return 1
+    fi
+    created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    python3 tools/ci_test_selection/write_build_provenance_manifest.py \
+        "${provenance_dir}" \
+        --repository-sha "${BUILDKITE_COMMIT}" \
+        --image-tag "${IMAGE_TAG}" \
+        --image-digest "${image_digest}" \
+        --created-at "${created_at}" \
+        --buildkite-build-id "${BUILDKITE_BUILD_ID:-}" \
+        --out "${provenance_dir}/manifest.json"
+    (cd "${provenance_tmp}" && \
+        buildkite-agent artifact upload "ci-build-provenance/*")
 }
 
 ecr_login() {
@@ -241,6 +277,15 @@ echo "CACHE_FROM_MAIN: ${CACHE_FROM_MAIN}"
 
 check_and_skip_if_image_exists
 
+if [[ "${IMAGE_ALREADY_EXISTS}" == "1" ]]; then
+    if [[ "${VLLM_CI_PUBLISH_BUILD_PROVENANCE:-0}" == "1" ]]; then
+        setup_buildx_builder
+        publish_build_provenance
+    fi
+    annotate_image_tags
+    exit 0
+fi
+
 echo "--- :docker: Setting up Docker buildx bake"
 echo "Target: ${TARGET}"
 echo "vLLM bake file: ${VLLM_BAKE_FILE_PATH}"
@@ -273,4 +318,5 @@ docker --debug buildx bake -f "${VLLM_BAKE_FILE_PATH}" -f "${CI_HCL_PATH}" --pro
 
 echo "--- :white_check_mark: Build complete"
 
+publish_build_provenance
 annotate_image_tags

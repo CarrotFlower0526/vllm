@@ -337,6 +337,7 @@ class TestJoin(unittest.TestCase):
 
     def test_deep_trace_preserves_launch_stack_ranges_and_native_path(self):
         con = sqlite3.connect(self.db)
+        con.execute("ALTER TABLE NVTX_EVENTS ADD COLUMN jsonText TEXT")
         con.execute("ALTER TABLE CUPTI_ACTIVITY_KIND_RUNTIME ADD COLUMN nameId INT")
         con.execute(
             "ALTER TABLE CUPTI_ACTIVITY_KIND_RUNTIME ADD COLUMN callchainId INT"
@@ -353,6 +354,10 @@ class TestJoin(unittest.TestCase):
                 (22, "/vllm-workspace/vllm/v1/worker/gpu_model_runner.py:123"),
                 (23, "libpython3.12.so"),
                 (24, "innerKernel"),
+                (26, "launch_kernel"),
+                (27, "/vllm-workspace/vllm/ops.py"),
+                (28, "test_x_inner"),
+                (29, "/vllm-workspace/tests/a.py"),
             ],
         )
         con.execute(
@@ -383,8 +388,28 @@ class TestJoin(unittest.TestCase):
         )
         con.execute(
             "INSERT INTO NVTX_EVENTS VALUES "
-            "(2100, 2900, ?, 'PyTorch::aten::matmul', NULL)",
+            "(2100, 2900, ?, 'PyTorch::aten::matmul', NULL, NULL)",
             (TID1,),
+        )
+        con.execute(
+            "INSERT INTO NVTX_EVENTS VALUES (?, NULL, ?, NULL, NULL, ?)",
+            (
+                2500,
+                TID1,
+                json.dumps(
+                    {
+                        "Python Backtrace on CUDA": {
+                            "Thread state ID": 1,
+                            "Thread state": "Running",
+                            "Frames count": 2,
+                            "Frames": [
+                                {"Function": 26, "File": 27, "Line": 44},
+                                {"Function": 28, "File": 29, "Line": 12},
+                            ],
+                        }
+                    }
+                ),
+            ),
         )
         con.commit()
         con.close()
@@ -409,6 +434,17 @@ class TestJoin(unittest.TestCase):
                             "destination": "elf-build-id:a",
                         }
                     ),
+                    json.dumps(
+                        {
+                            "source_kind": "file",
+                            "source": "csrc/ops.cu",
+                            "edge_kind": "compiles_kernel",
+                            "destination_kind": "kernel",
+                            "destination": K_INNER,
+                            "target": "_C",
+                            "object_path": "CMakeFiles/_C.dir/csrc/ops.cu.o",
+                        }
+                    ),
                 ]
             )
             + "\n",
@@ -427,16 +463,69 @@ class TestJoin(unittest.TestCase):
         self.assertEqual(inner["cuda_api"], "cudaLaunchKernel")
         self.assertEqual(inner["kernel_short"], "innerKernel")
         self.assertEqual(len(inner["cuda_callchain"]), 2)
+        self.assertEqual(
+            inner["python_backtrace"],
+            [
+                {
+                    "depth": 0,
+                    "file": "/vllm-workspace/vllm/ops.py",
+                    "function": "launch_kernel",
+                    "line": 44,
+                },
+                {
+                    "depth": 1,
+                    "file": "/vllm-workspace/tests/a.py",
+                    "function": "test_x_inner",
+                    "line": 12,
+                },
+            ],
+        )
         self.assertIn(
             "PyTorch::aten::matmul",
             [span["label"] for span in inner["active_ranges"]],
         )
         self.assertEqual(inner["artifacts"], ["elf-build-id:a"])
+        self.assertEqual(inner["translation_units"], ["csrc/ops.cu"])
         native = next(row for row in provenance if row["kernel_mangled"] == K_INNER)
         self.assertEqual(native["artifacts"][0]["targets"][0]["target"], "_C")
         self.assertEqual(native["artifacts"][0]["targets"][0]["files"], ["csrc/ops.cu"])
+        self.assertEqual(native["translation_units"], ["csrc/ops.cu"])
         self.assertGreater(summary["cuda_callchain_rate"], 0)
+        self.assertEqual(summary["python_backtrace_launches"], 1)
+        self.assertEqual(summary["python_backtrace_frames"], 2)
+        self.assertGreater(summary["translation_unit_join_rate"], 0)
         self.assertEqual(summary["runtime_alias_rows_deduplicated"], 1)
+
+    def test_deep_trace_rejects_incomplete_python_backtrace_payload(self):
+        con = sqlite3.connect(self.db)
+        con.execute("ALTER TABLE NVTX_EVENTS ADD COLUMN jsonText TEXT")
+        con.execute(
+            "INSERT INTO NVTX_EVENTS VALUES (?, NULL, ?, NULL, NULL, ?)",
+            (
+                2500,
+                TID1,
+                json.dumps(
+                    {
+                        "Python Backtrace on CUDA": {
+                            "Frames count": 2,
+                            "Frames": [
+                                {"Function": "launch", "File": "ops.py", "Line": 1}
+                            ],
+                        }
+                    }
+                ),
+            ),
+        )
+        con.commit()
+        con.close()
+
+        with self.assertRaisesRegex(SystemExit, "frame count disagrees"):
+            export_deep_trace(
+                self.db,
+                job_key="engine-1-gpu",
+                kernel_map=self.kmap,
+                build_graph=None,
+            )
 
 
 if __name__ == "__main__":
