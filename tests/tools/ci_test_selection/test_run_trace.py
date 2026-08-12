@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 from coverage import CoverageData
@@ -117,3 +120,58 @@ def test_import_preflight_accepts_installed_package_outside_checkout(tmp_path: P
     assert status == 0
     assert document["error"] is None
     assert document["vllm_file"] == str(installed_package / "__init__.py")
+
+
+def test_deep_python_trace_records_ordered_repository_calls(tmp_path: Path):
+    repo = tmp_path / "repo"
+    package = repo / "vllm"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "sample.py").write_text(
+        "def inner():\n    return 42\n\ndef outer():\n    return inner()\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "calls"
+    project_root = Path(__file__).resolve().parents[3]
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PYTHONPATH": os.pathsep.join([str(repo), str(project_root)]),
+            "PYTEST_CURRENT_TEST": "tests/test_sample.py::test_answer (call)",
+            "VLLM_CI_TEST_SELECTION_DEEP_TRACE_DIR": str(output),
+            "VLLM_CI_TEST_SELECTION_REPO_ROOT": str(repo),
+        }
+    )
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tools.ci_test_selection.deep_python_trace import "
+                "install_from_environment; install_from_environment(); "
+                "from vllm.sample import outer; assert outer() == 42"
+            ),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in next(output.glob("python-calls.*.jsonl")).read_text().splitlines()
+    ]
+    sample = [
+        row
+        for row in rows
+        if row["file"] == "vllm/sample.py" and not row["function"].endswith(".<module>")
+    ]
+    assert [(row["event"], row["function"].split(".")[-1]) for row in sample] == [
+        ("call", "outer"),
+        ("call", "inner"),
+        ("return", "inner"),
+        ("return", "outer"),
+    ]
+    assert [row["depth"] for row in sample] == [0, 1, 1, 0]
+    assert all(row["test_id"] == "tests/test_sample.py::test_answer" for row in sample)

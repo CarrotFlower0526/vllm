@@ -52,6 +52,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=Path, default=Path("/vllm-workspace"))
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--capture-gpu", action="store_true")
+    mode.add_argument("--deep-gpu", action="store_true")
     mode.add_argument("--python-only", action="store_true")
     return parser
 
@@ -70,6 +71,7 @@ def _run_command(
     repo_root: Path,
     represented_job_key: str,
     capture_gpu: bool,
+    deep_gpu: bool,
 ) -> subprocess.CompletedProcess[Any]:
     shard_dir = output_dir / "commands" / f"{command_index:03d}"
     shard_dir.mkdir(parents=True, exist_ok=True)
@@ -93,6 +95,7 @@ def _run_command(
     ]
     environment = dict(os.environ)
     environment["VLLM_CI_TEST_SELECTION_NVTX"] = "1" if capture_gpu else "0"
+    environment["VLLM_CI_TEST_SELECTION_DEEP_TRACE"] = "1" if deep_gpu else "0"
     if capture_gpu:
         wrapper = Path(__file__).with_name("run_traced.sh")
         environment["PUBLISH_BUILD_GRAPH"] = "1" if command_index == 0 else "0"
@@ -139,6 +142,7 @@ def main() -> int:
     command_results = []
     return_code = 0
     for index, command in enumerate(commands):
+        capture_gpu = args.capture_gpu or args.deep_gpu
         result = _run_command(
             command,
             command_index=index,
@@ -147,7 +151,8 @@ def main() -> int:
             output_dir=output_dir,
             repo_root=repo_root,
             represented_job_key=args.represented_job_key,
-            capture_gpu=args.capture_gpu,
+            capture_gpu=capture_gpu,
+            deep_gpu=args.deep_gpu,
         )
         shard_job = _job_document(output_dir / "commands" / f"{index:03d}" / "job.json")
         command_results.append(
@@ -169,7 +174,13 @@ def main() -> int:
     _atomic_json(
         summary_path,
         {
-            "capture_mode": "gpu" if args.capture_gpu else "python-only",
+            "capture_mode": (
+                "deep-gpu"
+                if args.deep_gpu
+                else "gpu"
+                if args.capture_gpu
+                else "python-only"
+            ),
             "collector_version": COLLECTOR_VERSION,
             "command_count": len(commands),
             "command_results": command_results,

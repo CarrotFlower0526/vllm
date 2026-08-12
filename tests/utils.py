@@ -1894,6 +1894,11 @@ def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]
                 "except ImportError:\n"
                 "    class Skipped(BaseException): pass\n"
                 "data = cloudpickle.loads(sys.stdin.buffer.read())\n"
+                "if __import__('os').environ.get("
+                "'VLLM_CI_TEST_SELECTION_DEEP_TRACE') == '1':\n"
+                "    from ci_test_selection.deep_python_trace import "
+                "install_from_environment\n"
+                "    install_from_environment()\n"
                 "mod = importlib.import_module(data['module'])\n"
                 "target = mod\n"
                 "for name in data['qualname'].split('.'):\n"
@@ -1951,7 +1956,9 @@ def create_new_process_for_each_test(
     Returns:
         A decorator to run test functions in separate processes.
     """
-    if method is None:
+    if os.environ.get("VLLM_CI_TEST_SELECTION_DEEP_TRACE") == "1":
+        method = "spawn"
+    elif method is None:
         method = "spawn" if requires_spawn_multiprocessing() else "fork"
 
     assert method in ["spawn", "fork"], "Method must be either 'spawn' or 'fork'"

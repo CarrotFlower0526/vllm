@@ -19,6 +19,8 @@ import subprocess
 import sys
 import unittest
 
+from tools.ci_test_selection.parse_deep_nsys_sqlite import export_deep_trace
+
 HERE = pathlib.Path(__file__).resolve().parent
 SCRIPT_DIR = HERE.parents[2] / "tools/ci_test_selection"
 
@@ -304,6 +306,98 @@ class TestJoin(unittest.TestCase):
         )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(self.out.read_text(), "last-good\n")
+
+    def test_deep_trace_preserves_launch_stack_ranges_and_native_path(self):
+        con = sqlite3.connect(self.db)
+        con.execute("ALTER TABLE CUPTI_ACTIVITY_KIND_RUNTIME ADD COLUMN nameId INT")
+        con.execute(
+            "ALTER TABLE CUPTI_ACTIVITY_KIND_RUNTIME ADD COLUMN callchainId INT"
+        )
+        con.execute("ALTER TABLE CUPTI_ACTIVITY_KIND_KERNEL ADD COLUMN shortName INT")
+        con.execute(
+            "ALTER TABLE CUPTI_ACTIVITY_KIND_KERNEL ADD COLUMN demangledName INT"
+        )
+        con.executemany(
+            "INSERT INTO StringIds VALUES (?, ?)",
+            [
+                (20, "cudaLaunchKernel"),
+                (21, "vllm.v1.worker.gpu_model_runner.execute_model"),
+                (22, "/vllm-workspace/vllm/v1/worker/gpu_model_runner.py:123"),
+                (23, "libpython3.12.so"),
+                (24, "innerKernel"),
+            ],
+        )
+        con.execute(
+            "UPDATE CUPTI_ACTIVITY_KIND_RUNTIME SET nameId=20, callchainId=7 "
+            "WHERE correlationId=12"
+        )
+        con.execute(
+            "UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET shortName=24, demangledName=24 "
+            "WHERE correlationId=12"
+        )
+        con.execute(
+            "CREATE TABLE CUDA_CALLCHAINS (id INT, symbol INT, module INT, "
+            "unresolved INT, originalIP INT, stackDepth INT)"
+        )
+        con.executemany(
+            "INSERT INTO CUDA_CALLCHAINS VALUES (7, ?, ?, 0, 0, ?)",
+            [(21, 23, 0), (22, 23, 1)],
+        )
+        con.execute(
+            "INSERT INTO NVTX_EVENTS VALUES "
+            "(2100, 2900, ?, 'PyTorch::aten::matmul', NULL)",
+            (TID1,),
+        )
+        con.commit()
+        con.close()
+
+        build_graph = pathlib.Path(self.tmp.name) / "build.jsonl"
+        build_graph.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "source_kind": "file",
+                            "source": "csrc/ops.cu",
+                            "destination_kind": "target",
+                            "destination": "_C",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "source_kind": "target",
+                            "source": "_C",
+                            "destination_kind": "artifact",
+                            "destination": "elf-build-id:a",
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        rows, provenance, summary = export_deep_trace(
+            self.db,
+            job_key="engine-1-gpu",
+            kernel_map=self.kmap,
+            build_graph=build_graph,
+        )
+
+        inner = next(row for row in rows if row["kernel_mangled"] == K_INNER)
+        self.assertEqual(inner["test_id"], "tests/a.py::test_x_inner")
+        self.assertEqual(inner["cuda_api"], "cudaLaunchKernel")
+        self.assertEqual(inner["kernel_short"], "innerKernel")
+        self.assertEqual(len(inner["cuda_callchain"]), 2)
+        self.assertIn(
+            "PyTorch::aten::matmul",
+            [span["label"] for span in inner["active_ranges"]],
+        )
+        self.assertEqual(inner["artifacts"], ["elf-build-id:a"])
+        native = next(row for row in provenance if row["kernel_mangled"] == K_INNER)
+        self.assertEqual(native["artifacts"][0]["targets"][0]["target"], "_C")
+        self.assertEqual(native["artifacts"][0]["targets"][0]["files"], ["csrc/ops.cu"])
+        self.assertGreater(summary["cuda_callchain_rate"], 0)
 
 
 if __name__ == "__main__":

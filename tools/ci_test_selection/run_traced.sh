@@ -45,6 +45,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_GRAPH_DIR="${BUILD_GRAPH_DIR:-/opt/vllm-ci/build-graph}"
 KERNEL_MAP="${KERNEL_MAP:-$BUILD_GRAPH_DIR/kernel-map.jsonl}"
 PUBLISH_BUILD_GRAPH="${PUBLISH_BUILD_GRAPH:-1}"
+DEEP_TRACE="${VLLM_CI_TEST_SELECTION_DEEP_TRACE:-0}"
 
 for name in build-graph.jsonl kernel-map.jsonl; do
     if [[ ! -s "$BUILD_GRAPH_DIR/$name" ]]; then
@@ -73,10 +74,21 @@ nsys --version
 # spawns pytest as a child process; without it the child's CUDA activity
 # is lost. The runner loads the NVTX plugin in that child.
 traced_start=$(date +%s)
+profile_options=(
+    --trace=cuda,nvtx --sample=none --cpuctxsw=none
+    --trace-fork-before-exec=true
+)
+if [[ "$DEEP_TRACE" == "1" ]]; then
+    profile_options=(
+        --trace=cuda,nvtx --sample=process-tree --cpuctxsw=none
+        --backtrace=dwarf --cudabacktrace=kernel --python-backtrace=cuda
+        --pytorch=functions-trace,autograd-nvtx
+        --trace-fork-before-exec=true
+    )
+fi
 set +e
 nsys profile \
-    --trace=cuda,nvtx --sample=none --cpuctxsw=none \
-    --trace-fork-before-exec=true \
+    "${profile_options[@]}" \
     --output "$OUT_DIR/trace" --force-overwrite=true \
     -- "$@"
 profile_status=$?
@@ -96,6 +108,16 @@ if [[ -s "$OUT_DIR/trace.nsys-rep" ]]; then
             --out "$OUT_DIR/gpu-trace.jsonl" \
             2> "$OUT_DIR/join-rate-summary.json"
         parse_status=$?
+        if (( parse_status == 0 )) && [[ "$DEEP_TRACE" == "1" ]]; then
+            python3 "$HERE/parse_deep_nsys_sqlite.py" "$OUT_DIR/trace.sqlite" \
+                --kernel-map "$KERNEL_MAP" \
+                --build-graph "$BUILD_GRAPH_DIR/build-graph.jsonl" \
+                --job-key "$REPRESENTED_JOB_KEY" \
+                --out "$OUT_DIR/deep-gpu-trace.jsonl" \
+                --provenance-out "$OUT_DIR/deep-native-provenance.jsonl" \
+                --summary-out "$OUT_DIR/deep-trace-summary.json"
+            parse_status=$?
+        fi
     else
         parse_status=$export_status
         printf '{"error":"nsys export failed","exit_code":%d}\n' \

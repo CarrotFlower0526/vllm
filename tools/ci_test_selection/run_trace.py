@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import heapq
 import json
 import os
 import subprocess
@@ -46,6 +47,46 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _merge_ordered_jsonl(paths: list[Path], output: Path) -> int:
+    streams = [path.open(encoding="utf-8") for path in paths]
+    heap: list[tuple[int, int, int, dict[str, Any]]] = []
+    rows = 0
+    try:
+        for index, stream in enumerate(streams):
+            line = stream.readline()
+            if line:
+                row = json.loads(line)
+                heapq.heappush(
+                    heap,
+                    (int(row["monotonic_ns"]), int(row["sequence"]), index, row),
+                )
+        temporary = output.with_suffix(output.suffix + ".tmp")
+        with temporary.open("w", encoding="utf-8") as destination:
+            while heap:
+                _timestamp, _sequence, index, row = heapq.heappop(heap)
+                destination.write(
+                    json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                )
+                rows += 1
+                line = streams[index].readline()
+                if line:
+                    next_row = json.loads(line)
+                    heapq.heappush(
+                        heap,
+                        (
+                            int(next_row["monotonic_ns"]),
+                            int(next_row["sequence"]),
+                            index,
+                            next_row,
+                        ),
+                    )
+        temporary.replace(output)
+    finally:
+        for stream in streams:
+            stream.close()
+    return rows
 
 
 def _git_sha(repo_root: Path) -> str:
@@ -309,6 +350,8 @@ def main() -> int:
     coverage_file = output_dir / ".coverage"
     node_file = output_dir / "pytest-nodes.json"
     trace_file = output_dir / "python-trace.jsonl"
+    call_trace_file = output_dir / "python-call-trace.jsonl"
+    call_trace_dir = output_dir / "python-call-shards"
     job_file = output_dir / "job.json"
     repository_sha = _git_sha(args.repo_root)
 
@@ -318,6 +361,10 @@ def main() -> int:
         repo_root=args.repo_root,
         auto_load_pytest=bool(args.command_base64),
     )
+    deep_trace = os.environ.get("VLLM_CI_TEST_SELECTION_DEEP_TRACE") == "1"
+    if deep_trace:
+        environment["VLLM_CI_TEST_SELECTION_DEEP_TRACE_DIR"] = str(call_trace_dir)
+        environment["VLLM_CI_TEST_SELECTION_REPO_ROOT"] = str(args.repo_root.resolve())
     command_cwd = (args.command_cwd or args.repo_root).resolve()
     if args.command_base64:
         command_text = _decode_command(args.command_base64)
@@ -353,15 +400,29 @@ def main() -> int:
     )
     _atomic_jsonl(trace_file, rows)
     node_document = _merge_node_documents(output_dir, node_file)
+    call_trace_rows = (
+        _merge_ordered_jsonl(
+            sorted(call_trace_dir.glob("python-calls.*.jsonl")), call_trace_file
+        )
+        if deep_trace and call_trace_dir.is_dir()
+        else 0
+    )
+    if deep_trace and call_trace_dir.is_dir():
+        for path in call_trace_dir.glob("python-calls.*.jsonl"):
+            path.unlink()
+        call_trace_dir.rmdir()
+    if deep_trace and not call_trace_file.exists():
+        _atomic_jsonl(call_trace_file, [])
     healthy = (
         result.returncode == 0
         and bool(node_document["collected"])
         and coverage_file.exists()
+        and (not deep_trace or call_trace_rows > 0)
     )
     _atomic_json(
         job_file,
         {
-            "child_process_attribution": False,
+            "child_process_attribution": deep_trace,
             "collector_version": COLLECTOR_VERSION,
             "command_sha256": (
                 hashlib.sha256(command_text.encode("utf-8")).hexdigest()
@@ -379,6 +440,11 @@ def main() -> int:
             "python_trace": trace_file.name,
             "python_trace_rows": len(rows),
             "python_trace_sha256": _sha256(trace_file),
+            "python_call_trace": call_trace_file.name if deep_trace else None,
+            "python_call_trace_rows": call_trace_rows,
+            "python_call_trace_sha256": (
+                _sha256(call_trace_file) if deep_trace else None
+            ),
             "repository_sha": repository_sha,
             "represented_job_key": args.represented_job_key,
         },
