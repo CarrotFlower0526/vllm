@@ -15,14 +15,23 @@ Usage: pytest -p nvtx_test_ranges ... (with this file on PYTHONPATH), or
 copy next to conftest.py and add to plugins.
 """
 
+import os
+
 import pytest
 
-try:
-    import torch
 
-    _nvtx = torch.cuda.nvtx if torch.cuda.is_available() else None
-except Exception:
-    _nvtx = None
+def _configured_nvtx():
+    if os.environ.get("VLLM_CI_TEST_SELECTION_NVTX") != "1":
+        return None
+    try:
+        import torch
+
+        return torch.cuda.nvtx if torch.cuda.is_available() else None
+    except Exception:
+        return None
+
+
+_nvtx = _configured_nvtx()
 
 PREFIX = {
     "setup": "citest-setup::",

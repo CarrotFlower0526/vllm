@@ -6,10 +6,12 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pybase64 as base64
 import pytest
 
+from tools.ci_test_selection.nvtx_test_ranges import _configured_nvtx
 from tools.ci_test_selection.run_job_trace import decode_commands
 
 
@@ -58,6 +60,19 @@ def test_gpu_wrapper_does_not_prepend_checkout_root_to_pythonpath():
     assert 'PYTHONPATH="$REPO_ROOT' not in wrapper
 
 
+def test_python_only_nvtx_gate_does_not_initialize_cuda(monkeypatch):
+    def fail_if_called():
+        raise AssertionError("python-only collection touched CUDA")
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=fail_if_called),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setenv("VLLM_CI_TEST_SELECTION_NVTX", "0")
+
+    assert _configured_nvtx() is None
+
+
 @pytest.mark.parametrize("document", [[], [""], {"command": "pytest"}, [1]])
 def test_decode_commands_rejects_invalid_documents(document):
     with pytest.raises(SystemExit):
@@ -73,8 +88,11 @@ def test_python_only_job_preserves_pytest_command_and_collects_trace(tmp_path: P
     (repo / "vllm" / "__init__.py").write_text("", encoding="utf-8")
     source.write_text("def answer():\n    return 42\n", encoding="utf-8")
     test_file.write_text(
+        "import os\n\n"
         "from vllm.sample import answer\n\n"
-        "def test_answer():\n    assert answer() == 42\n",
+        "def test_answer():\n    assert answer() == 42\n\n"
+        "def test_nvtx_is_disabled():\n"
+        "    assert os.environ['VLLM_CI_TEST_SELECTION_NVTX'] == '0'\n",
         encoding="utf-8",
     )
     output = tmp_path / "trace"
@@ -113,9 +131,14 @@ def test_python_only_job_preserves_pytest_command_and_collects_trace(tmp_path: P
     ]
     assert {row["file"] for row in trace_rows} == {"vllm/sample.py"}
     assert {row["test_id"] for row in trace_rows} == {
-        "tests/test_sample.py::test_answer"
+        "tests/test_sample.py::test_answer",
     }
-    assert json.loads((shard / "job.json").read_text())["healthy"] is True
+    job = json.loads((shard / "job.json").read_text())
+    assert job["healthy"] is True
+    assert set(job["node_ids"]) == {
+        "tests/test_sample.py::test_answer",
+        "tests/test_sample.py::test_nvtx_is_disabled",
+    }
     summary = json.loads((output / "trace-job.json").read_text())
     assert summary["healthy"] is True
     assert summary["capture_mode"] == "python-only"

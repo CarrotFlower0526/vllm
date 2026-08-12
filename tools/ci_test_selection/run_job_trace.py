@@ -92,6 +92,7 @@ def _run_command(
         _encoded_command(command),
     ]
     environment = dict(os.environ)
+    environment["VLLM_CI_TEST_SELECTION_NVTX"] = "1" if capture_gpu else "0"
     if capture_gpu:
         wrapper = Path(__file__).with_name("run_traced.sh")
         environment["PUBLISH_BUILD_GRAPH"] = "1" if command_index == 0 else "0"
