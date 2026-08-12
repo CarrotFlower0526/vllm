@@ -162,6 +162,33 @@ steps:
     - pytest -v -s kernels/attention/test_flashmla_sparse.py
     - pytest -v -s kernels/attention/test_mla_cross_layer_kernel_equivalence.py
 
+- label: CI Trace Pilot - FlashMLA (H100)
+  key: ci-trace-flashmla-h100
+  timeout_in_minutes: 40
+  device: h100
+  num_devices: 1
+  working_dir: "/vllm-workspace/"
+  optional: true
+  soft_fail: true
+  source_file_dependencies:
+  - cmake/external_projects/flashmla.cmake
+  - vllm/v1/attention/ops/flashmla.py
+  - tests/kernels/attention/test_flashmla.py
+  - tests/kernels/attention/test_flashmla_sparse.py
+  - tests/kernels/attention/test_mla_cross_layer_kernel_equivalence.py
+  commands:
+    - >-
+      python -m tools.ci_test_selection.run_trace
+      --output-dir test-selection-artifacts/python
+      --job-key ci-trace-flashmla-h100
+      --represented-job-key kernels-flashmla-test-h100
+      --
+      tests/kernels/attention/test_flashmla.py
+      tests/kernels/attention/test_flashmla_sparse.py
+      tests/kernels/attention/test_mla_cross_layer_kernel_equivalence.py
+  artifact_paths:
+    - test-selection-artifacts/**/*
+
 - label: ":nvidia: (L4) Quantization Kernels Shard %N"
   key: kernels-quantization-test
   timeout_in_minutes: 60
