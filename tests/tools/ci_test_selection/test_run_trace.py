@@ -9,6 +9,7 @@ from pathlib import Path
 
 from coverage import CoverageData
 
+from tools.ci_test_selection.deep_python_trace import _repository_path
 from tools.ci_test_selection.run_trace import (
     _command_environment,
     coverage_rows,
@@ -36,6 +37,11 @@ def test_normalize_repository_path_rejects_non_vllm(tmp_path: Path):
     assert (
         normalize_repository_path(str(tmp_path / "torch" / "ops.py"), tmp_path) is None
     )
+
+
+def test_deep_trace_rejects_python_pseudo_filenames(tmp_path: Path):
+    assert _repository_path("<frozen importlib._bootstrap>", tmp_path) is None
+    assert _repository_path("<string>", tmp_path) is None
 
 
 def test_coverage_rows_are_per_test_and_canonical(tmp_path: Path):

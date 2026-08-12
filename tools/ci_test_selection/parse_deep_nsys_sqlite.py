@@ -16,6 +16,11 @@ from heapq import heappop, heappush
 from pathlib import Path
 from typing import Any
 
+try:
+    from .nsys_runtime import load_runtime_launches
+except ImportError:  # direct script execution from run_traced.sh
+    from nsys_runtime import load_runtime_launches
+
 CALL_PREFIX = "citest::"
 AUX_PREFIXES = ("citest-setup::", "citest-teardown::")
 
@@ -216,34 +221,7 @@ def export_deep_trace(
             for thread, spans in ranges_by_tid.items()
         }
 
-        runtime_columns = _columns(connection, "CUPTI_ACTIVITY_KIND_RUNTIME")
-        required_runtime = {"correlationId", "globalTid", "start"}
-        if not required_runtime <= runtime_columns:
-            raise SystemExit("CUDA runtime table lacks launch correlation columns")
-        runtime_optional = [
-            name for name in ("end", "nameId", "callchainId") if name in runtime_columns
-        ]
-        runtime_select = ", ".join(
-            ["correlationId", "globalTid", "start", *runtime_optional]
-        )
-        launches: dict[tuple[int, int], dict[str, Any]] = {}
-        duplicates = set()
-        for row in connection.execute(
-            f"SELECT {runtime_select} FROM CUPTI_ACTIVITY_KIND_RUNTIME"
-        ):
-            correlation_id, global_tid, start, *values = row
-            key = (int(global_tid) >> 24, int(correlation_id))
-            launch = {
-                "correlation_id": int(correlation_id),
-                "global_tid": int(global_tid),
-                "process_key": int(global_tid) >> 24,
-                "start_ns": int(start),
-            }
-            launch.update(dict(zip(runtime_optional, values)))
-            if key in launches:
-                duplicates.add(key)
-            else:
-                launches[key] = launch
+        launches, runtime_aliases = load_runtime_launches(connection, strings)
 
         temporal = _temporal_attributions(test_ranges, launches)
         callchains = _load_callchains(connection, strings)
@@ -275,8 +253,6 @@ def export_deep_trace(
         ):
             correlation_id, mangled, process_value, *optional_values = values
             key = (int(process_value) >> 24, int(correlation_id))
-            if key in duplicates:
-                raise SystemExit("duplicate CUDA correlation ID within one process")
             launch = launches.get(key)
             if launch is None:
                 continue
@@ -396,6 +372,7 @@ def export_deep_trace(
         "job_key": job_key,
         "kernel_launch_rows": len(rows),
         "python_callchain_hint_rate": python_frames / len(rows) if rows else 0,
+        "runtime_alias_rows_deduplicated": runtime_aliases,
         "static_join_rate": (
             sum(bool(row["artifacts"]) for row in rows) / len(rows) if rows else 0
         ),

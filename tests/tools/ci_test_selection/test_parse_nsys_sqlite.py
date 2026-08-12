@@ -307,6 +307,34 @@ class TestJoin(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(self.out.read_text(), "last-good\n")
 
+    def test_versioned_cuda_api_alias_is_soundly_deduplicated(self):
+        con = sqlite3.connect(self.db)
+        con.execute("ALTER TABLE CUPTI_ACTIVITY_KIND_RUNTIME ADD COLUMN nameId INT")
+        con.execute(
+            "ALTER TABLE CUPTI_ACTIVITY_KIND_RUNTIME ADD COLUMN callchainId INT"
+        )
+        con.executemany(
+            "INSERT INTO StringIds VALUES (?, ?)",
+            [(30, "cudaLaunchKernel"), (31, "cudaLaunchKernel_v7000")],
+        )
+        con.execute(
+            "UPDATE CUPTI_ACTIVITY_KIND_RUNTIME SET nameId=30, callchainId=7 "
+            "WHERE correlationId=12"
+        )
+        con.execute(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME "
+            "(start, end, correlationId, globalTid, nameId, callchainId) "
+            "VALUES (2501, 2509, 12, ?, 31, NULL)",
+            (TID1,),
+        )
+        con.commit()
+        con.close()
+
+        edges, summary = self.run_parser()
+        inner = next(edge for edge in edges if edge["source"] == K_INNER)
+        self.assertEqual(inner["destination"], "tests/a.py::test_x_inner")
+        self.assertEqual(summary["runtime_alias_rows_deduplicated"], 1)
+
     def test_deep_trace_preserves_launch_stack_ranges_and_native_path(self):
         con = sqlite3.connect(self.db)
         con.execute("ALTER TABLE CUPTI_ACTIVITY_KIND_RUNTIME ADD COLUMN nameId INT")
@@ -330,6 +358,16 @@ class TestJoin(unittest.TestCase):
         con.execute(
             "UPDATE CUPTI_ACTIVITY_KIND_RUNTIME SET nameId=20, callchainId=7 "
             "WHERE correlationId=12"
+        )
+        con.execute(
+            "INSERT INTO StringIds VALUES (?, ?)",
+            (25, "cudaLaunchKernel_v7000"),
+        )
+        con.execute(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME "
+            "(start, end, correlationId, globalTid, nameId, callchainId) "
+            "VALUES (2501, 2509, 12, ?, 25, NULL)",
+            (TID1,),
         )
         con.execute(
             "UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET shortName=24, demangledName=24 "
@@ -398,6 +436,7 @@ class TestJoin(unittest.TestCase):
         self.assertEqual(native["artifacts"][0]["targets"][0]["target"], "_C")
         self.assertEqual(native["artifacts"][0]["targets"][0]["files"], ["csrc/ops.cu"])
         self.assertGreater(summary["cuda_callchain_rate"], 0)
+        self.assertEqual(summary["runtime_alias_rows_deduplicated"], 1)
 
 
 if __name__ == "__main__":

@@ -11,8 +11,9 @@ import os
 import sys
 import threading
 import time
+from functools import cache
 from pathlib import Path
-from types import FrameType
+from types import CodeType, FrameType
 from typing import Any
 
 _OUTPUT_ENV = "VLLM_CI_TEST_SELECTION_DEEP_TRACE_DIR"
@@ -20,7 +21,13 @@ _REPO_ROOT_ENV = "VLLM_CI_TEST_SELECTION_REPO_ROOT"
 _STATE: _TraceState | None = None
 
 
+@cache
 def _repository_path(filename: str, repo_root: Path | None) -> str | None:
+    # CPython pseudo-filenames such as ``<frozen importlib._bootstrap>`` and
+    # ``<string>`` resolve beneath the current working directory. Treating
+    # them as repository paths produced millions of false trace events.
+    if filename.startswith("<") and filename.endswith(">"):
+        return None
     path = Path(filename).resolve()
     if repo_root is not None:
         try:
@@ -40,9 +47,9 @@ def _repository_path(filename: str, repo_root: Path | None) -> str | None:
     return None
 
 
-def _function(frame: FrameType) -> str:
-    module = frame.f_globals.get("__name__")
-    qualname = getattr(frame.f_code, "co_qualname", frame.f_code.co_name)
+@cache
+def _function(code: CodeType, module: str | None) -> str:
+    qualname = getattr(code, "co_qualname", code.co_name)
     return f"{module}.{qualname}" if module else qualname
 
 
@@ -53,15 +60,30 @@ class _TraceState:
             "w", encoding="utf-8", buffering=1024 * 1024
         )
         self._repo_root = repo_root
+        self._pid = os.getpid()
         self._sequence = 0
         self._depths: dict[int, int] = {}
+        self._buffer: list[str] = []
+        self._buffer_limit = 4096
         self._lock = threading.Lock()
         self._closed = False
+
+    def _metadata(self, frame: FrameType) -> tuple[str | None, str]:
+        code = frame.f_code
+        return (
+            _repository_path(code.co_filename, self._repo_root),
+            _function(code, frame.f_globals.get("__name__")),
+        )
+
+    def _flush(self) -> None:
+        if self._buffer:
+            self._stream.writelines(self._buffer)
+            self._buffer.clear()
 
     def profile(self, frame: FrameType, event: str, _arg: Any) -> None:
         if event not in {"call", "return"}:
             return
-        file = _repository_path(frame.f_code.co_filename, self._repo_root)
+        file, function = self._metadata(frame)
         if file is None:
             return
 
@@ -73,21 +95,20 @@ class _TraceState:
                 self._depths[thread_id] = depth
 
             caller = frame.f_back
+            caller_file, caller_function = (
+                self._metadata(caller) if caller is not None else (None, None)
+            )
             row = {
-                "caller_file": (
-                    _repository_path(caller.f_code.co_filename, self._repo_root)
-                    if caller is not None
-                    else None
-                ),
-                "caller_function": _function(caller) if caller is not None else None,
+                "caller_file": caller_file,
+                "caller_function": caller_function,
                 "caller_line": caller.f_lineno if caller is not None else None,
                 "depth": depth,
                 "event": event,
                 "file": file,
                 "first_line": frame.f_code.co_firstlineno,
-                "function": _function(frame),
+                "function": function,
                 "monotonic_ns": time.monotonic_ns(),
-                "pid": os.getpid(),
+                "pid": self._pid,
                 "sequence": self._sequence,
                 "test_id": os.environ.get("PYTEST_CURRENT_TEST", "").removesuffix(
                     " (call)"
@@ -95,8 +116,9 @@ class _TraceState:
                 "thread_id": thread_id,
             }
             self._sequence += 1
-            self._stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")))
-            self._stream.write("\n")
+            self._buffer.append(json.dumps(row, separators=(",", ":")) + "\n")
+            if len(self._buffer) >= self._buffer_limit:
+                self._flush()
 
             if event == "call":
                 self._depths[thread_id] = depth + 1
@@ -108,6 +130,7 @@ class _TraceState:
             if self._closed:
                 return
             self._closed = True
+            self._flush()
             self._stream.close()
 
 

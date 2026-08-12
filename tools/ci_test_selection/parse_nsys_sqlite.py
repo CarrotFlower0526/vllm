@@ -34,6 +34,11 @@ from bisect import bisect_right
 from collections import Counter, defaultdict
 from heapq import heappop, heappush
 
+try:
+    from .nsys_runtime import load_runtime_launches
+except ImportError:  # direct script execution from run_traced.sh
+    from nsys_runtime import load_runtime_launches
+
 CALL_PREFIX = "citest::"
 AUX_PREFIXES = ("citest-setup::", "citest-teardown::")
 
@@ -179,18 +184,14 @@ def main(argv=None):
 
         # CUPTI correlation IDs are process-scoped: with fork tracing enabled
         # two processes can reuse the same correlationId, so the kernel->launch
-        # join must include process identity. nsys serializes it in the high
-        # bits of globalTid/globalPid (PID key = value >> 24).
-        launches = {}
-        duplicate_launches = set()
-        for cid, gtid, start in con.execute(
-            "SELECT correlationId, globalTid, start FROM CUPTI_ACTIVITY_KIND_RUNTIME"
-        ):
-            key = (gtid >> 24, cid)
-            if key in launches:
-                duplicate_launches.add(key)
-            else:
-                launches[key] = (gtid, start)
+        # join must include process identity. Recent Nsight versions can also
+        # emit nested versioned/unversioned API aliases for one launch; the
+        # shared loader collapses only aliases proven by name/thread/interval.
+        runtime_launches, runtime_aliases = load_runtime_launches(con, strings)
+        launches = {
+            key: (launch["global_tid"], launch["start_ns"])
+            for key, launch in runtime_launches.items()
+        }
         temporal_by_launch = temporal_attributions(ranges, launches)
 
         kernel_cols = columns(con, "CUPTI_ACTIVITY_KIND_KERNEL")
@@ -234,11 +235,6 @@ def main(argv=None):
             name = strings.get(name_id, name_id)
             if process_scoped:
                 launch_key = (row[2] >> 24, cid)
-                if launch_key in duplicate_launches:
-                    raise SystemExit(
-                        "kernel references a duplicate CUDA runtime correlation "
-                        "ID within one process"
-                    )
                 launch = launches.get(launch_key)
             else:
                 if cid in collided:
@@ -335,6 +331,7 @@ def main(argv=None):
     summary["unique_kernel_test_pairs"] = len(seen_pairs)
     summary["unique_kernel_destination_pairs"] = len(seen_pairs)
     summary["citest_ranges"] = len(ranges)
+    summary["runtime_alias_rows_deduplicated"] = runtime_aliases
     attributed = sum(
         stats[f"class_{bucket}"] for bucket in ("matched", "ambiguous", "unmapped")
     )
