@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -126,15 +127,102 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--job-key", required=True)
     parser.add_argument("--represented-job-key", required=True)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    parser.add_argument("--command-base64")
+    parser.add_argument("--command-cwd", type=Path)
     parser.add_argument("tests", nargs=argparse.REMAINDER)
     return parser
+
+
+def pytest_command(tests: list[str]) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-p",
+        "tools.ci_test_selection.pytest_trace_plugin",
+        "-p",
+        "tools.ci_test_selection.nvtx_test_ranges",
+        "--cov=vllm",
+        "--cov-context=test",
+        "--cov-report=",
+        *tests,
+    ]
+
+
+def _decode_command(value: str) -> str:
+    try:
+        return base64.b64decode(value, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as error:
+        message = "--command-base64 must contain base64-encoded UTF-8"
+        raise SystemExit(message) from error
+
+
+def _command_environment(
+    *,
+    coverage_file: Path,
+    node_file: Path,
+    repo_root: Path,
+    auto_load_pytest: bool,
+) -> dict[str, str]:
+    environment = dict(os.environ)
+    environment["COVERAGE_FILE"] = str(coverage_file)
+    environment["VLLM_CI_TEST_SELECTION_NODEIDS"] = str(node_file)
+
+    if auto_load_pytest:
+        plugins = [
+            "tools.ci_test_selection.pytest_trace_plugin",
+            "tools.ci_test_selection.nvtx_test_ranges",
+        ]
+        configured_plugins = environment.get("PYTEST_PLUGINS")
+        if configured_plugins:
+            plugins.append(configured_plugins)
+        environment["PYTEST_PLUGINS"] = ",".join(plugins)
+
+        trace_options = "--cov=vllm --cov-context=test --cov-report="
+        existing_options = environment.get("PYTEST_ADDOPTS", "")
+        environment["PYTEST_ADDOPTS"] = " ".join(
+            option for option in (existing_options, trace_options) if option
+        )
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        value for value in (str(repo_root), existing_pythonpath) if value
+    )
+    return environment
+
+
+def _merge_node_documents(output_dir: Path, node_file: Path) -> dict[str, Any]:
+    documents = []
+    for path in sorted(output_dir.glob("pytest-nodes*.json")):
+        documents.append(json.loads(path.read_text(encoding="utf-8")))
+    if not documents:
+        return {"collected": [], "exit_status": None, "outcomes": {}}
+
+    collected: set[str] = set()
+    outcomes: dict[str, dict[str, str]] = {}
+    exit_statuses: list[int] = []
+    for document in documents:
+        collected.update(document.get("collected", []))
+        for node_id, phases in document.get("outcomes", {}).items():
+            outcomes.setdefault(node_id, {}).update(phases)
+        if document.get("exit_status") is not None:
+            exit_statuses.append(int(document["exit_status"]))
+
+    merged = {
+        "collected": sorted(collected),
+        "exit_status": max(exit_statuses, default=None),
+        "outcomes": {node_id: outcomes[node_id] for node_id in sorted(outcomes)},
+    }
+    _atomic_json(node_file, merged)
+    return merged
 
 
 def main() -> int:
     args = _parser().parse_args()
     tests = args.tests[1:] if args.tests[:1] == ["--"] else args.tests
-    if not tests:
-        raise SystemExit("at least one pytest target is required after --")
+    if bool(tests) == bool(args.command_base64):
+        raise SystemExit(
+            "provide exactly one of --command-base64 or pytest targets after --"
+        )
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -144,23 +232,22 @@ def main() -> int:
     job_file = output_dir / "job.json"
     repository_sha = _git_sha(args.repo_root)
 
-    environment = dict(os.environ)
-    environment["COVERAGE_FILE"] = str(coverage_file)
-    environment["VLLM_CI_TEST_SELECTION_NODEIDS"] = str(node_file)
-    command = [
-        sys.executable,
-        "-m",
-        "pytest",
-        "-p",
-        "tools.ci_test_selection.pytest_trace_plugin",
-        "--cov=vllm",
-        "--cov-context=test",
-        "--cov-report=",
-        *tests,
-    ]
+    environment = _command_environment(
+        coverage_file=coverage_file,
+        node_file=node_file,
+        repo_root=args.repo_root,
+        auto_load_pytest=bool(args.command_base64),
+    )
+    command_cwd = (args.command_cwd or args.repo_root).resolve()
+    if args.command_base64:
+        command_text = _decode_command(args.command_base64)
+        command = ["bash", "-lc", command_text]
+    else:
+        command_text = None
+        command = pytest_command(tests)
     result = subprocess.run(
         command,
-        cwd=args.repo_root,
+        cwd=command_cwd,
         env=environment,
         check=False,
     )
@@ -176,19 +263,23 @@ def main() -> int:
         else []
     )
     _atomic_jsonl(trace_file, rows)
-    node_document = (
-        json.loads(node_file.read_text(encoding="utf-8"))
-        if node_file.exists()
-        else {"collected": [], "exit_status": result.returncode, "outcomes": {}}
-    )
+    node_document = _merge_node_documents(output_dir, node_file)
     healthy = (
-        result.returncode == 0 and bool(node_document["collected"]) and bool(rows)
+        result.returncode == 0
+        and bool(node_document["collected"])
+        and coverage_file.exists()
     )
     _atomic_json(
         job_file,
         {
             "child_process_attribution": False,
             "collector_version": COLLECTOR_VERSION,
+            "command_sha256": (
+                hashlib.sha256(command_text.encode("utf-8")).hexdigest()
+                if command_text is not None
+                else None
+            ),
+            "command_cwd": str(command_cwd),
             "created_at": datetime.now(UTC).isoformat(),
             "healthy": healthy,
             "image_tag": os.environ.get("IMAGE_TAG"),
@@ -196,6 +287,7 @@ def main() -> int:
             "node_ids": node_document["collected"],
             "pytest_exit_code": result.returncode,
             "python_trace": trace_file.name,
+            "python_trace_rows": len(rows),
             "python_trace_sha256": _sha256(trace_file),
             "repository_sha": repository_sha,
             "represented_job_key": args.represented_job_key,

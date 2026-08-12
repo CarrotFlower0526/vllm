@@ -32,6 +32,9 @@ def pytest_sessionfinish(session: Any, exitstatus: int) -> None:
         },
     }
     path = Path(output)
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker:
+        path = path.with_name(f"{path.stem}.{worker}{path.suffix}")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(

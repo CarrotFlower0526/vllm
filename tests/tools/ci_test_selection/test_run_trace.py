@@ -5,6 +5,7 @@ from coverage import CoverageData
 from tools.ci_test_selection.run_trace import (
     coverage_rows,
     normalize_repository_path,
+    pytest_command,
 )
 
 
@@ -54,3 +55,11 @@ def test_coverage_rows_are_per_test_and_canonical(tmp_path: Path):
         ("tests/kernels/test_ops.py::test_two", 2),
     ]
     assert all(row["file"] == "vllm/attention/ops.py" for row in rows)
+
+
+def test_pytest_command_loads_python_and_nvtx_plugins():
+    command = pytest_command(["tests/kernels/test_ops.py"])
+
+    assert "tools.ci_test_selection.pytest_trace_plugin" in command
+    assert "tools.ci_test_selection.nvtx_test_ranges" in command
+    assert command[-1] == "tests/kernels/test_ops.py"

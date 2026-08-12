@@ -341,6 +341,7 @@ WORKDIR /workspace
 
 COPY pyproject.toml setup.py CMakeLists.txt ./
 COPY tools/build_rust.py tools/build_rust.py
+COPY tools/ci_test_selection tools/ci_test_selection/
 COPY cmake cmake/
 COPY csrc csrc/
 COPY vllm/envs.py vllm/envs.py
@@ -363,6 +364,10 @@ ARG VLLM_MAIN_CUDA_VERSION=""
 
 # Use dummy version for csrc-build wheel (only .so files are extracted, version doesn't matter)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+csrc.build"
+# Request a CMake File API reply from source builds. Precompiled-wheel builds
+# do not configure CMake; the capture step below records that absence without
+# breaking the regular image build, and the optional trace job then soft-fails.
+ENV VLLM_CI_CAPTURE_BUILD_GRAPH=1
 
 # Use existing torch for nightly builds
 RUN --mount=type=cache,target=/opt/uv/cache \
@@ -410,6 +415,35 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         export VLLM_DOCKER_BUILD_CONTEXT=1 && \
         export DEEPGEMM_PYTHON_INTERPRETERS=$(cat /tmp/dg_pythons.txt) && \
         python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38; \
+    fi
+
+# Persist checkout-agnostic native provenance in the image. The Buildkite
+# trace wrapper stamps it with the exact repository SHA and timestamp when it
+# publishes the artifacts. A precompiled build intentionally has no File API
+# reply and therefore no build-graph.jsonl: the shadow trace step detects and
+# reports that incomplete evidence instead of publishing a misleading graph.
+RUN set -eu; \
+    mkdir -p /opt/vllm-ci/build-graph; \
+    reply_dir="$(find build -type d -path '*/.cmake/api/v1/reply' -print -quit 2>/dev/null || true)"; \
+    if [ -n "$reply_dir" ]; then \
+        build_dir="${reply_dir%/.cmake/api/v1/reply}"; \
+        python3 tools/ci_test_selection/export_build_graph.py \
+            "$build_dir" --source-root /workspace \
+            --out /tmp/native-build-graph.jsonl; \
+        python3 tools/ci_test_selection/extract_kernel_symbols.py \
+            "$(find dist -maxdepth 1 -name '*.whl' -print -quit)" \
+            --out /opt/vllm-ci/build-graph/kernel-map.jsonl; \
+        cat /tmp/native-build-graph.jsonl \
+            /opt/vllm-ci/build-graph/kernel-map.jsonl \
+            > /opt/vllm-ci/build-graph/build-graph.jsonl; \
+        test -s /opt/vllm-ci/build-graph/build-graph.jsonl; \
+        python3 tools/ci_test_selection/validate_build_graph.py \
+            /opt/vllm-ci/build-graph/build-graph.jsonl \
+            --required-file cmake/external_projects/flashmla.cmake \
+            --required-target _flashmla_C; \
+    else \
+        echo "No CMake File API reply; native test-selection graph unavailable" \
+            > /opt/vllm-ci/build-graph/MISSING; \
     fi
 
 #################### CSRC BUILD IMAGE ####################
@@ -926,6 +960,8 @@ ARG PIP_KEYRING_PROVIDER UV_KEYRING_PROVIDER
 
 # We can specify the standard or nightly build of PyTorch
 ARG PYTORCH_NIGHTLY
+
+COPY --from=csrc-build /opt/vllm-ci/build-graph /opt/vllm-ci/build-graph
 
 # Install vLLM and EP kernel wheels after the stable test dependencies so
 # source-only changes do not invalidate the dependency layers above.
