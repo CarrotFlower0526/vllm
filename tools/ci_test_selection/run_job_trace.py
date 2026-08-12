@@ -109,13 +109,13 @@ def _job_document(path: Path) -> dict[str, Any] | None:
     return document if isinstance(document, dict) else None
 
 
-def _upload_artifacts(output_dir: Path) -> int | None:
+def _upload_artifacts(pattern: str) -> int | None:
     if not os.environ.get("BUILDKITE"):
         return None
     if not shutil.which("buildkite-agent"):
         return 127
     result = subprocess.run(
-        ["buildkite-agent", "artifact", "upload", f"{output_dir}/**/*"],
+        ["buildkite-agent", "artifact", "upload", pattern],
         check=False,
     )
     return result.returncode
@@ -124,6 +124,7 @@ def _upload_artifacts(output_dir: Path) -> int | None:
 def main() -> int:
     args = _parser().parse_args()
     commands = decode_commands(args.commands_base64)
+    artifact_pattern = str(args.output_dir / "**/*")
     output_dir = args.output_dir.resolve()
     repo_root = args.repo_root.resolve()
     command_cwd = Path.cwd().resolve()
@@ -172,7 +173,7 @@ def main() -> int:
             "represented_job_key": args.represented_job_key,
         },
     )
-    upload_status = _upload_artifacts(output_dir)
+    upload_status = _upload_artifacts(artifact_pattern)
     if not healthy and return_code == 0:
         return_code = 1
     if upload_status not in (None, 0) and return_code == 0:
