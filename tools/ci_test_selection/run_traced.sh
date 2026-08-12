@@ -42,7 +42,6 @@ REPRESENTED_JOB_KEY="$2"
 shift 2
 mkdir -p "$OUT_DIR"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 BUILD_GRAPH_DIR="${BUILD_GRAPH_DIR:-/opt/vllm-ci/build-graph}"
 KERNEL_MAP="${KERNEL_MAP:-$BUILD_GRAPH_DIR/kernel-map.jsonl}"
 PUBLISH_BUILD_GRAPH="${PUBLISH_BUILD_GRAPH:-1}"
@@ -75,7 +74,7 @@ nsys --version
 # is lost. The runner loads the NVTX plugin in that child.
 traced_start=$(date +%s)
 set +e
-PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" nsys profile \
+nsys profile \
     --trace=cuda,nvtx --sample=none --cpuctxsw=none \
     --trace-fork-before-exec=true \
     --output "$OUT_DIR/trace" --force-overwrite=true \

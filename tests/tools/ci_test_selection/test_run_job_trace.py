@@ -49,6 +49,15 @@ def test_top_level_collector_package_avoids_tests_tools_shadowing():
     assert "ci_test_selection.nvtx_test_ranges" in result.stdout
 
 
+def test_gpu_wrapper_does_not_prepend_checkout_root_to_pythonpath():
+    project_root = Path(__file__).resolve().parents[3]
+    wrapper = (
+        project_root / "tools" / "ci_test_selection" / "run_traced.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'PYTHONPATH="$REPO_ROOT' not in wrapper
+
+
 @pytest.mark.parametrize("document", [[], [""], {"command": "pytest"}, [1]])
 def test_decode_commands_rejects_invalid_documents(document):
     with pytest.raises(SystemExit):

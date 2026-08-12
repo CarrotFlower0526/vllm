@@ -195,6 +195,81 @@ def _command_environment(
     return environment
 
 
+_IMPORT_PREFLIGHT = r"""
+import json
+import os
+from pathlib import Path
+import sys
+
+document = {
+    "error": None,
+    "sys_executable": sys.executable,
+    "sys_path": sys.path,
+    "vllm_file": None,
+}
+try:
+    import vllm
+
+    resolved = Path(vllm.__file__).resolve()
+    document["vllm_file"] = str(resolved)
+    checkout_value = os.environ.get("BUILDKITE_BUILD_CHECKOUT_PATH")
+    expected_root_value = os.environ.get("VLLM_CI_TEST_SELECTION_REPO_ROOT")
+    if checkout_value and expected_root_value:
+        checkout = Path(checkout_value).resolve()
+        expected_root = Path(expected_root_value).resolve()
+        try:
+            resolved.relative_to(checkout)
+        except ValueError:
+            pass
+        else:
+            if expected_root != checkout:
+                document["error"] = "image job imported vllm from checkout source"
+except Exception as error:
+    document["error"] = f"{type(error).__name__}: {error}"
+
+print(json.dumps(document, sort_keys=True, separators=(",", ":")))
+raise SystemExit(1 if document["error"] else 0)
+"""
+
+
+def validate_import_environment(
+    *,
+    command_cwd: Path,
+    environment: dict[str, str],
+    output_path: Path,
+    repo_root: Path,
+) -> int:
+    """Prove the traced command imports the image's vLLM, not checkout source."""
+
+    preflight_environment = dict(environment)
+    preflight_environment["VLLM_CI_TEST_SELECTION_REPO_ROOT"] = str(repo_root.resolve())
+    result = subprocess.run(
+        [sys.executable, "-c", _IMPORT_PREFLIGHT],
+        cwd=command_cwd,
+        env=preflight_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    if stdout:
+        print(f"trace import preflight: {stdout}")
+    if stderr:
+        print(stderr, file=sys.stderr)
+    try:
+        document = json.loads(stdout.splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        document = {
+            "error": "import preflight did not emit valid JSON",
+            "stderr": stderr,
+            "stdout": stdout,
+        }
+    document["exit_code"] = result.returncode
+    _atomic_json(output_path, document)
+    return result.returncode
+
+
 def _merge_node_documents(output_dir: Path, node_file: Path) -> dict[str, Any]:
     documents = []
     for path in sorted(output_dir.glob("pytest-nodes*.json")):
@@ -250,12 +325,21 @@ def main() -> int:
     else:
         command_text = None
         command = pytest_command(tests)
-    result = subprocess.run(
-        command,
-        cwd=command_cwd,
-        env=environment,
-        check=False,
+    preflight_status = validate_import_environment(
+        command_cwd=command_cwd,
+        environment=environment,
+        output_path=output_dir / "import-environment.json",
+        repo_root=args.repo_root,
     )
+    if preflight_status == 0:
+        result = subprocess.run(
+            command,
+            cwd=command_cwd,
+            env=environment,
+            check=False,
+        )
+    else:
+        result = subprocess.CompletedProcess(command, preflight_status)
 
     rows = (
         coverage_rows(
@@ -288,6 +372,7 @@ def main() -> int:
             "created_at": datetime.now(UTC).isoformat(),
             "healthy": healthy,
             "image_tag": os.environ.get("IMAGE_TAG"),
+            "import_preflight_exit_code": preflight_status,
             "job_key": args.job_key,
             "node_ids": node_document["collected"],
             "pytest_exit_code": result.returncode,

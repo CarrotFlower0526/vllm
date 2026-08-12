@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from pathlib import Path
 
 from coverage import CoverageData
@@ -9,6 +10,7 @@ from tools.ci_test_selection.run_trace import (
     coverage_rows,
     normalize_repository_path,
     pytest_command,
+    validate_import_environment,
 )
 
 
@@ -66,3 +68,52 @@ def test_pytest_command_loads_python_and_nvtx_plugins():
     assert "tools.ci_test_selection.pytest_trace_plugin" in command
     assert "tools.ci_test_selection.nvtx_test_ranges" in command
     assert command[-1] == "tests/kernels/test_ops.py"
+
+
+def test_import_preflight_rejects_checkout_source_for_image_job(tmp_path: Path):
+    checkout = tmp_path / "checkout"
+    source_package = checkout / "vllm"
+    source_package.mkdir(parents=True)
+    (source_package / "__init__.py").write_text("", encoding="utf-8")
+    output = tmp_path / "import-environment.json"
+    environment = {
+        "BUILDKITE_BUILD_CHECKOUT_PATH": str(checkout),
+        "PYTHONPATH": str(checkout),
+    }
+
+    status = validate_import_environment(
+        command_cwd=tmp_path,
+        environment=environment,
+        output_path=output,
+        repo_root=tmp_path / "image-workspace",
+    )
+
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert status == 1
+    assert document["error"] == "image job imported vllm from checkout source"
+    assert document["vllm_file"] == str(source_package / "__init__.py")
+
+
+def test_import_preflight_accepts_installed_package_outside_checkout(tmp_path: Path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    installed_package = tmp_path / "site-packages" / "vllm"
+    installed_package.mkdir(parents=True)
+    (installed_package / "__init__.py").write_text("", encoding="utf-8")
+    output = tmp_path / "import-environment.json"
+    environment = {
+        "BUILDKITE_BUILD_CHECKOUT_PATH": str(checkout),
+        "PYTHONPATH": str(installed_package.parent),
+    }
+
+    status = validate_import_environment(
+        command_cwd=tmp_path,
+        environment=environment,
+        output_path=output,
+        repo_root=tmp_path / "image-workspace",
+    )
+
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert status == 0
+    assert document["error"] is None
+    assert document["vllm_file"] == str(installed_package / "__init__.py")
