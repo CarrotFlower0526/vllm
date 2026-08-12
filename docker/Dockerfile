@@ -427,9 +427,15 @@ RUN set -eu; \
     reply_dir="$(find build -type d -path '*/.cmake/api/v1/reply' -print -quit 2>/dev/null || true)"; \
     if [ -n "$reply_dir" ]; then \
         build_dir="${reply_dir%/.cmake/api/v1/reply}"; \
+        ninja -C "$build_dir" -t deps > /tmp/ninja-deps.txt; \
+        test -s /tmp/ninja-deps.txt; \
         python3 tools/ci_test_selection/export_build_graph.py \
             "$build_dir" --source-root /workspace \
-            --out /tmp/native-build-graph.jsonl; \
+            --ninja-deps /tmp/ninja-deps.txt \
+            --out /tmp/native-build-graph.jsonl \
+            2> /tmp/native-build-graph-summary.json; \
+        python3 -c 'import json; d=json.load(open("/tmp/native-build-graph-summary.json")); assert d.get("header_dep_source") == "ninja_deps", d; assert d.get("dep_file_target_pairs", 0) > 0, d; assert d.get("include_edges", 0) > 0, d'; \
+        cat /tmp/native-build-graph-summary.json; \
         python3 tools/ci_test_selection/extract_kernel_symbols.py \
             "$(find dist -maxdepth 1 -name '*.whl' -print -quit)" \
             --out /opt/vllm-ci/build-graph/kernel-map.jsonl; \
