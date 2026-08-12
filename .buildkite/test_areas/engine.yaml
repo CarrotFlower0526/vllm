@@ -39,6 +39,9 @@ steps:
 - label: ":nvidia: (L4) V1 Engine"
   key: engine-1-gpu
   timeout_in_minutes: 45
+  # This job validates fork-propagated engine state. CUPTI initializes CUDA in
+  # the parent before fork, so its trace clone must retain Python evidence only.
+  trace_mode: python-only
   source_file_dependencies:
     - vllm/v1/engine/
     - tests/v1/engine/
