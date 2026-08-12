@@ -3,7 +3,7 @@
 # tracing, export sqlite, and emit kernel->test edges + join-rate table.
 #
 # This is ONE trace step, not a second pytest execution: the profiled
-# command is the D2 runner (python -m tools.ci_test_selection.run_trace),
+# command is the D2 runner (python -m ci_test_selection.run_trace),
 # which loads the NVTX per-test plugin in its child pytest, so Python
 # coverage, node/outcome health, and GPU edges come from the same run.
 #
@@ -26,7 +26,7 @@
 #
 # Usage: run_traced.sh <output-dir> <represented-job-key> <command...>
 #   e.g. run_traced.sh /tmp/trace kernels-flashmla-test-h100 \
-#        python3 -m tools.ci_test_selection.run_trace ...
+#        python3 -m ci_test_selection.run_trace ...
 set -euo pipefail
 
 NSYS_DEB_URL="https://developer.download.nvidia.com/devtools/repos/ubuntu2204/amd64/NsightSystems-linux-cli-public-2026.3.1.157-3804839.deb"

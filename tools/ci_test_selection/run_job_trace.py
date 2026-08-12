@@ -73,10 +73,11 @@ def _run_command(
 ) -> subprocess.CompletedProcess[Any]:
     shard_dir = output_dir / "commands" / f"{command_index:03d}"
     shard_dir.mkdir(parents=True, exist_ok=True)
+    package = __package__ or "ci_test_selection"
     runner = [
         sys.executable,
         "-m",
-        "tools.ci_test_selection.run_trace",
+        f"{package}.run_trace",
         "--output-dir",
         str(shard_dir),
         "--job-key",

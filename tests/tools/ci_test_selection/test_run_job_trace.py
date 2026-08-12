@@ -23,6 +23,32 @@ def test_decode_commands_round_trip():
     assert decode_commands(_payload(commands)) == commands
 
 
+def test_top_level_collector_package_avoids_tests_tools_shadowing():
+    project_root = Path(__file__).resolve().parents[3]
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(project_root / "tools")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import ci_test_selection.run_trace as runner; "
+                "print(runner.pytest_command([]))"
+            ),
+        ],
+        cwd=project_root / "tests",
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ci_test_selection.pytest_trace_plugin" in result.stdout
+    assert "ci_test_selection.nvtx_test_ranges" in result.stdout
+
+
 @pytest.mark.parametrize("document", [[], [""], {"command": "pytest"}, [1]])
 def test_decode_commands_rejects_invalid_documents(document):
     with pytest.raises(SystemExit):

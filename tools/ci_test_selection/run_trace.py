@@ -137,14 +137,15 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def pytest_command(tests: list[str]) -> list[str]:
+    package = __package__ or "ci_test_selection"
     return [
         sys.executable,
         "-m",
         "pytest",
         "-p",
-        "tools.ci_test_selection.pytest_trace_plugin",
+        f"{package}.pytest_trace_plugin",
         "-p",
-        "tools.ci_test_selection.nvtx_test_ranges",
+        f"{package}.nvtx_test_ranges",
         "--cov=vllm",
         "--cov-context=test",
         "--cov-report=",
@@ -172,9 +173,10 @@ def _command_environment(
     environment["VLLM_CI_TEST_SELECTION_NODEIDS"] = str(node_file)
 
     if auto_load_pytest:
+        package = __package__ or "ci_test_selection"
         plugins = [
-            "tools.ci_test_selection.pytest_trace_plugin",
-            "tools.ci_test_selection.nvtx_test_ranges",
+            f"{package}.pytest_trace_plugin",
+            f"{package}.nvtx_test_ranges",
         ]
         configured_plugins = environment.get("PYTEST_PLUGINS")
         if configured_plugins:
