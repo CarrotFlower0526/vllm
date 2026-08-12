@@ -10,6 +10,7 @@ from pathlib import Path
 from coverage import CoverageData
 
 from tools.ci_test_selection.run_trace import (
+    _command_environment,
     coverage_rows,
     normalize_repository_path,
     pytest_command,
@@ -71,6 +72,28 @@ def test_pytest_command_loads_python_and_nvtx_plugins():
     assert "tools.ci_test_selection.pytest_trace_plugin" in command
     assert "tools.ci_test_selection.nvtx_test_ranges" in command
     assert command[-1] == "tests/kernels/test_ops.py"
+
+
+def test_deep_environment_disables_pytest_assertion_rewriting(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-ra")
+
+    environment = _command_environment(
+        coverage_file=tmp_path / ".coverage",
+        node_file=tmp_path / "nodes.json",
+        repo_root=tmp_path,
+        auto_load_pytest=True,
+        plain_assertions=True,
+    )
+
+    assert environment["PYTEST_ADDOPTS"].split() == [
+        "-ra",
+        "--cov=vllm",
+        "--cov-context=test",
+        "--cov-report=",
+        "--assert=plain",
+    ]
 
 
 def test_import_preflight_rejects_checkout_source_for_image_job(tmp_path: Path):

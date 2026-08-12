@@ -208,6 +208,7 @@ def _command_environment(
     node_file: Path,
     repo_root: Path,
     auto_load_pytest: bool,
+    plain_assertions: bool = False,
 ) -> dict[str, str]:
     environment = dict(os.environ)
     environment["COVERAGE_FILE"] = str(coverage_file)
@@ -224,11 +225,20 @@ def _command_environment(
             plugins.append(configured_plugins)
         environment["PYTEST_PLUGINS"] = ",".join(plugins)
 
-        trace_options = "--cov=vllm --cov-context=test --cov-report="
-        existing_options = environment.get("PYTEST_ADDOPTS", "")
-        environment["PYTEST_ADDOPTS"] = " ".join(
-            option for option in (existing_options, trace_options) if option
-        )
+    trace_options = (
+        "--cov=vllm --cov-context=test --cov-report=" if auto_load_pytest else ""
+    )
+    # Nsight's --python-backtrace instrumentation is incompatible with
+    # pytest's AssertionRewritingHook (the injected finder treats the hook as
+    # a path string). Deep runs are diagnostics, so disable only assertion
+    # rewriting while retaining normal assertion semantics.
+    assertion_options = "--assert=plain" if plain_assertions else ""
+    existing_options = environment.get("PYTEST_ADDOPTS", "")
+    environment["PYTEST_ADDOPTS"] = " ".join(
+        option
+        for option in (existing_options, trace_options, assertion_options)
+        if option
+    )
     existing_pythonpath = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = os.pathsep.join(
         value for value in (str(repo_root), existing_pythonpath) if value
@@ -355,13 +365,14 @@ def main() -> int:
     job_file = output_dir / "job.json"
     repository_sha = _git_sha(args.repo_root)
 
+    deep_trace = os.environ.get("VLLM_CI_TEST_SELECTION_DEEP_TRACE") == "1"
     environment = _command_environment(
         coverage_file=coverage_file,
         node_file=node_file,
         repo_root=args.repo_root,
         auto_load_pytest=bool(args.command_base64),
+        plain_assertions=deep_trace,
     )
-    deep_trace = os.environ.get("VLLM_CI_TEST_SELECTION_DEEP_TRACE") == "1"
     if deep_trace:
         environment["VLLM_CI_TEST_SELECTION_DEEP_TRACE_DIR"] = str(call_trace_dir)
         environment["VLLM_CI_TEST_SELECTION_REPO_ROOT"] = str(args.repo_root.resolve())
