@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Static artifact->kernel edge exporter (MVP D1, kernel-join prerequisite).
 
 Enumerates CUDA kernel identities from built shared objects without a GPU or
@@ -30,12 +33,13 @@ import hashlib
 import json
 import os
 import pathlib
-import re
 import subprocess
 import sys
 import tempfile
 import zipfile
 from collections import defaultdict
+
+import regex as re
 
 # nvcc host stubs: _Z<len>__device_stub__<kernel-id><param-mangling>, plus
 # guard-variable (_ZGVZ) and internal-linkage (L) decorated variants. The

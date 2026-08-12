@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Pytest plugin: wrap every test phase in an NVTX range named by nodeid.
 
 nsys records these ranges alongside CUDA launch activity; the parser joins

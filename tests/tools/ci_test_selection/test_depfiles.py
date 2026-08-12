@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Tests for header dependency ingestion (ninja -t deps / .d fallback).
 
 The primary format is `ninja -t deps` tool output because CMake+Ninja

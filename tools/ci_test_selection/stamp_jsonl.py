@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Stamp published JSONL edge rows with wrapper-owned provenance fields.
 
 The raw exporters stay checkout-agnostic; this Buildkite-wrapper step adds
@@ -12,9 +15,10 @@ Usage: stamp_jsonl.py <file.jsonl> --repository-sha <40hex> \
 import argparse
 import json
 import os
-import re
 import sys
 import tempfile
+
+import regex as re
 
 
 def main(argv=None):

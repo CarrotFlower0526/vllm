@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Header dependency ingestion for the build-graph exporter (D1).
 
 Primary source: `ninja -t deps` output captured while the build tree still
@@ -15,8 +18,9 @@ unattributed.
 """
 
 import pathlib
-import re
 from collections import defaultdict
+
+import regex as re
 
 _SPLIT = re.compile(r"(?<!\\)[ \t\n]+")
 _NINJA_HEADER = re.compile(r"^(\S+): #deps \d+, deps mtime \d+ \((\w+)\)$")

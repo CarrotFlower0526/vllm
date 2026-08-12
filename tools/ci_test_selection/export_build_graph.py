@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Build-graph exporter (MVP D1): file->target->artifact from CMake state.
 
 Reads the CMake File API codemodel-v2 reply from an actual configured
@@ -34,11 +37,12 @@ Usage:
 import argparse
 import json
 import pathlib
-import re
 import subprocess
 import sys
 import tempfile
 from collections import defaultdict
+
+import regex as re
 
 try:
     from .depfiles import collect_file_target_pairs, load_rules

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Fixture-based tests for the nsys sqlite parser's join logic.
 
 Builds a synthetic database shaped like an nsys 2024+ export (StringIds,

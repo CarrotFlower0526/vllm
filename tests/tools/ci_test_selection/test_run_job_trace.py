@@ -1,10 +1,13 @@
-import base64
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+import pybase64 as base64
 import pytest
 
 from tools.ci_test_selection.run_job_trace import decode_commands

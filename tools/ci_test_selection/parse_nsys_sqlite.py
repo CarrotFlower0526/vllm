@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """nsys sqlite export -> kernel->test JSONL edges + join-rate table (MVP D3).
 
 Attribution is by LAUNCH SITE, not execution time: each GPU kernel row is
