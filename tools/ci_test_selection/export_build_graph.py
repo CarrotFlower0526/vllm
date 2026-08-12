@@ -17,13 +17,18 @@ Prerequisite in CI: the build must run with the File API query present
 (write an empty file at <build>/.cmake/api/v1/query/codemodel-v2 before
 configuring; vllm's setup.py cmake invocation picks it up transparently).
 
-Known gap (documented, not silent): codemodel sources are the files CMake
-knows about; transitively included headers need .d depfile augmentation,
-which is out of MVP scope. Out-of-tree (generated) sources are counted in
-the summary, not emitted as repo file nodes.
+Header dependencies come from `--ninja-deps` (a captured `ninja -t deps`
+dump — CMake+Ninja deletes on-disk .d files after consuming them into
+.ninja_deps, so the dump must be taken while the build tree exists) and are
+emitted as `includes` edges, distinct from `member_of` so selection reports
+can separate "recompiles a source of" from "reaches it through an include".
+Without `--ninja-deps`, on-disk *.d files are scanned as the make-generator
+fallback. Out-of-tree (generated) sources are counted in the summary, not
+emitted as repo file nodes.
 
 Usage:
-    export_build_graph.py <build-dir> [--source-root <repo>] [--out edges.jsonl]
+    export_build_graph.py <build-dir> [--source-root <repo>]
+        [--ninja-deps deps.txt] [--out edges.jsonl]
 """
 
 import argparse
@@ -34,6 +39,11 @@ import subprocess
 import sys
 import tempfile
 from collections import defaultdict
+
+try:
+    from .depfiles import collect_file_target_pairs, load_rules
+except ImportError:
+    from depfiles import collect_file_target_pairs, load_rules
 
 
 def find_codemodel(reply_dir):
@@ -121,6 +131,12 @@ def main(argv=None):
         "(default: codemodel's paths.source)",
     )
     ap.add_argument("--out", default="-", help="edge JSONL output")
+    ap.add_argument(
+        "--ninja-deps",
+        default=None,
+        help="captured `ninja -t deps` output; falls back to scanning "
+        "on-disk *.d files (make generator) when omitted",
+    )
     args = ap.parse_args(argv)
 
     build_dir = pathlib.Path(args.build_dir).resolve()
@@ -149,6 +165,9 @@ def main(argv=None):
             target_docs.append(doc)
             id_to_name[doc.get("id", tref.get("id", doc["name"]))] = doc["name"]
 
+    member_pairs = set()
+    known_targets = {doc["name"] for doc in target_docs}
+
     for doc in target_docs:
         name = doc["name"]
         stats["targets"] += 1
@@ -169,6 +188,7 @@ def main(argv=None):
                 stats["out_of_tree_sources"] += 1
                 continue
             stats["file_edges"] += 1
+            member_pairs.add((rel, name))
             emit(
                 {
                     "source_kind": "file",
@@ -223,6 +243,29 @@ def main(argv=None):
             if not on_disk.is_file():
                 stats["artifacts_missing_on_disk"] += 1
             emit(row)
+
+    dep_rules, dep_source = load_rules(args.ninja_deps, build_dir)
+    pairs, dep_stats = collect_file_target_pairs(dep_rules, build_dir, source_root)
+    stats["header_dep_source"] = dep_source
+    for key, value in dep_stats.items():
+        stats[f"dep_{key}"] = value
+    for rel, target in pairs:
+        if (rel, target) in member_pairs:
+            # the compiled source itself; already a member_of edge
+            continue
+        if target not in known_targets:
+            stats["dep_targets_unknown"] += 1
+            continue
+        stats["include_edges"] += 1
+        emit(
+            {
+                "source_kind": "file",
+                "source": rel,
+                "edge_kind": "includes",
+                "destination_kind": "target",
+                "destination": target,
+            }
+        )
 
     rows.sort()
     if args.out == "-":
