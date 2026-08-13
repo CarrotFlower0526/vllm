@@ -98,6 +98,19 @@ check_and_skip_if_image_exists() {
     fi
 }
 
+resolve_image_digest() {
+    local image_ref="$1"
+    local output digest
+    output="$(docker buildx imagetools inspect "${image_ref}")"
+    digest="$(awk '$1 == "Digest:" { print $2; exit }' <<< "${output}")"
+    if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        echo "Invalid image index digest for ${image_ref}:" >&2
+        echo "${output}" >&2
+        return 1
+    fi
+    printf '%s\n' "${digest}"
+}
+
 publish_build_provenance() {
     if [[ "${VLLM_CI_PUBLISH_BUILD_PROVENANCE:-0}" != "1" ]]; then
         return
@@ -114,12 +127,10 @@ publish_build_provenance() {
         .
     test -s "${provenance_dir}/build-graph.jsonl"
     test -s "${provenance_dir}/kernel-map.jsonl"
-    image_digest="$(docker buildx imagetools inspect "${IMAGE_TAG}" \
-        --format '{{.Manifest.Digest}}')"
-    if [[ ! "${image_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-        echo "Invalid image digest for ${IMAGE_TAG}: ${image_digest}" >&2
-        return 1
-    fi
+    # Pin the OCI index digest printed by every deployed buildx version. The
+    # index covers the linux/amd64 image and its BuildKit attestation manifest;
+    # `.Manifest.Digest` is not portable across older buildx clients.
+    image_digest="$(resolve_image_digest "${IMAGE_TAG}")"
     created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     python3 tools/ci_test_selection/write_build_provenance_manifest.py \
         "${provenance_dir}" \
