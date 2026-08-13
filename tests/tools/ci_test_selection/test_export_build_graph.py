@@ -236,6 +236,39 @@ class TestExport(unittest.TestCase):
             document["files"]["kernel-map.jsonl"]["sha256"], r"^[0-9a-f]{64}$"
         )
 
+    def test_static_manifest_writer_runs_without_site_packages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            (directory / "build-graph.jsonl").write_text('{"graph":1}\n')
+            (directory / "kernel-map.jsonl").write_text('{"kernel":1}\n')
+            output = directory / "manifest.json"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-S",
+                    str(SCRIPT_DIR / "write_build_provenance_manifest.py"),
+                    str(directory),
+                    "--repository-sha",
+                    "a" * 40,
+                    "--image-tag",
+                    "registry/vllm:test",
+                    "--image-digest",
+                    "sha256:" + "b" * 64,
+                    "--created-at",
+                    "2026-08-13T00:00:00Z",
+                    "--buildkite-build-id",
+                    "build-id",
+                    "--out",
+                    str(output),
+                ],
+                check=True,
+            )
+
+            document = json.loads(output.read_text())
+
+        self.assertEqual(document["kind"], "static-build-provenance")
+        self.assertEqual(document["buildkite_build_id"], "build-id")
+
 
 if __name__ == "__main__":
     unittest.main()

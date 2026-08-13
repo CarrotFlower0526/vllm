@@ -11,10 +11,22 @@ import hashlib
 import json
 import pathlib
 import tempfile
-
-import regex as re
+from datetime import datetime
 
 STATIC_FILES = ("build-graph.jsonl", "kernel-map.jsonl")
+LOWER_HEX = frozenset("0123456789abcdef")
+
+
+def _is_lower_hex(value: str, length: int) -> bool:
+    return len(value) == length and all(character in LOWER_HEX for character in value)
+
+
+def _is_utc_timestamp(value: str) -> bool:
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ") == value
 
 
 def _sha256(path: pathlib.Path) -> str:
@@ -34,11 +46,13 @@ def build_manifest(
     created_at: str,
     buildkite_build_id: str | None = None,
 ) -> dict[str, object]:
-    if not re.fullmatch(r"[0-9a-f]{40}", repository_sha):
+    if not _is_lower_hex(repository_sha, 40):
         raise ValueError(f"not a 40-hex repository SHA: {repository_sha!r}")
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
+    if not image_digest.startswith("sha256:") or not _is_lower_hex(
+        image_digest.removeprefix("sha256:"), 64
+    ):
         raise ValueError(f"not a sha256 image digest: {image_digest!r}")
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", created_at):
+    if not _is_utc_timestamp(created_at):
         raise ValueError(f"not a UTC RFC3339 timestamp: {created_at!r}")
     files = {}
     for name in STATIC_FILES:
