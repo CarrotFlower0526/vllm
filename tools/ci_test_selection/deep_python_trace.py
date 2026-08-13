@@ -21,6 +21,15 @@ _REPO_ROOT_ENV = "VLLM_CI_TEST_SELECTION_REPO_ROOT"
 _STATE: _TraceState | None = None
 
 
+def _current_test_id() -> str:
+    value = os.environ.get("PYTEST_CURRENT_TEST", "")
+    for phase in ("setup", "call", "teardown"):
+        suffix = f" ({phase})"
+        if value.endswith(suffix):
+            return value.removesuffix(suffix)
+    return value
+
+
 @cache
 def _repository_path(filename: str, repo_root: Path | None) -> str | None:
     # CPython pseudo-filenames such as ``<frozen importlib._bootstrap>`` and
@@ -110,9 +119,7 @@ class _TraceState:
                 "monotonic_ns": time.monotonic_ns(),
                 "pid": self._pid,
                 "sequence": self._sequence,
-                "test_id": os.environ.get("PYTEST_CURRENT_TEST", "").removesuffix(
-                    " (call)"
-                ),
+                "test_id": _current_test_id(),
                 "thread_id": thread_id,
             }
             self._sequence += 1

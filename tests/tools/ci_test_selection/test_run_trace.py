@@ -7,9 +7,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from coverage import CoverageData
 
-from tools.ci_test_selection.deep_python_trace import _repository_path
+from tools.ci_test_selection.deep_python_trace import (
+    _current_test_id,
+    _repository_path,
+)
 from tools.ci_test_selection.run_trace import (
     _command_environment,
     coverage_rows,
@@ -42,6 +46,15 @@ def test_normalize_repository_path_rejects_non_vllm(tmp_path: Path):
 def test_deep_trace_rejects_python_pseudo_filenames(tmp_path: Path):
     assert _repository_path("<frozen importlib._bootstrap>", tmp_path) is None
     assert _repository_path("<string>", tmp_path) is None
+
+
+@pytest.mark.parametrize("phase", ["setup", "call", "teardown"])
+def test_deep_trace_normalizes_pytest_phase(monkeypatch, phase: str):
+    monkeypatch.setenv(
+        "PYTEST_CURRENT_TEST", f"tests/kernels/test_ops.py::test_one ({phase})"
+    )
+
+    assert _current_test_id() == "tests/kernels/test_ops.py::test_one"
 
 
 def test_coverage_rows_are_per_test_and_canonical(tmp_path: Path):
@@ -203,4 +216,59 @@ def test_deep_python_trace_records_ordered_repository_calls(tmp_path: Path):
         ("return", "outer"),
     ]
     assert [row["depth"] for row in sample] == [0, 1, 1, 0]
+    assert all(row["test_id"] == "tests/test_sample.py::test_answer" for row in sample)
+
+
+def test_pytest_plugin_records_main_process_deep_calls(tmp_path: Path):
+    repo = tmp_path / "repo"
+    package = repo / "vllm"
+    tests = repo / "tests"
+    package.mkdir(parents=True)
+    tests.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "sample.py").write_text(
+        "def inner():\n    return 42\n\ndef outer():\n    return inner()\n",
+        encoding="utf-8",
+    )
+    (tests / "test_sample.py").write_text(
+        "from vllm.sample import outer\n\n"
+        "def test_answer():\n"
+        "    assert outer() == 42\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "calls"
+    project_root = Path(__file__).resolve().parents[3]
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PYTHONPATH": os.pathsep.join([str(repo), str(project_root)]),
+            "PYTEST_PLUGINS": "tools.ci_test_selection.pytest_trace_plugin",
+            "VLLM_CI_TEST_SELECTION_DEEP_TRACE": "1",
+            "VLLM_CI_TEST_SELECTION_DEEP_TRACE_DIR": str(output),
+            "VLLM_CI_TEST_SELECTION_REPO_ROOT": str(repo),
+        }
+    )
+
+    subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "tests/test_sample.py"],
+        cwd=repo,
+        env=environment,
+        check=True,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in next(output.glob("python-calls.*.jsonl")).read_text().splitlines()
+    ]
+    sample = [
+        row
+        for row in rows
+        if row["file"] == "vllm/sample.py" and not row["function"].endswith(".<module>")
+    ]
+    assert [(row["event"], row["function"].split(".")[-1]) for row in sample] == [
+        ("call", "outer"),
+        ("call", "inner"),
+        ("return", "inner"),
+        ("return", "outer"),
+    ]
     assert all(row["test_id"] == "tests/test_sample.py::test_answer" for row in sample)

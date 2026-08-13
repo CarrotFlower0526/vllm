@@ -13,6 +13,18 @@ from typing import Any
 _STATE: dict[str, Any] = {"collected": [], "outcomes": {}}
 
 
+def pytest_configure(config: Any) -> None:
+    # Most exact-node diagnostics execute directly in pytest's main process.
+    # The spawn-per-test helper installs the ordered recorder in its own child,
+    # but relying on that helper alone leaves ordinary kernel tests with an
+    # empty call trace. Install once in every pytest process; the recorder is a
+    # no-op unless deep tracing configured its output directory.
+    if os.environ.get("VLLM_CI_TEST_SELECTION_DEEP_TRACE") == "1":
+        from .deep_python_trace import install_from_environment
+
+        install_from_environment()
+
+
 def pytest_collection_finish(session: Any) -> None:
     _STATE["collected"] = sorted(item.nodeid for item in session.items)
 
