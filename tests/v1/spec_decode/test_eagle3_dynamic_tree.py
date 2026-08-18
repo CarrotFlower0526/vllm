@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from vllm.v1.spec_decode.residual_tree import (
@@ -130,6 +131,7 @@ def test_dynamic_provenance_records_generated_frontier_and_final_counts() -> Non
         "frontier_width": 10,
         "frontier_h2_only_quota": 0,
         "preserve_spine_count": 0,
+        "final_boundary_exchange": {"mode": "none", "exchanged": False},
         "generated_by_depth": [
             {
                 "depth": 1,
@@ -201,6 +203,89 @@ def test_dynamic_provenance_records_generated_frontier_and_final_counts() -> Non
             },
         ],
     }
+
+
+def test_parent_supported_boundary_exchange_swaps_only_one_leaf() -> None:
+    def candidates(states):
+        token_rows = []
+        probability_rows = []
+        for state in states:
+            if int(state) == 1:
+                token_rows.append([3, 4])
+                probability_rows.append([0.5, 0.32])
+            else:
+                token_rows.append([5, 6])
+                probability_rows.append([0.5, 0.1])
+        return (
+            torch.tensor(token_rows, dtype=torch.long),
+            torch.tensor(probability_rows, dtype=torch.float32),
+        )
+
+    common = {
+        "root_states": [0],
+        "root_candidate_tokens": torch.tensor([[1, 2]], dtype=torch.long),
+        "root_candidate_probabilities": torch.tensor([[0.9, 0.6]]),
+        "candidate_batch_fn": candidates,
+        "transition_batch_fn": lambda states, token_ids: list(token_ids),
+        "head_lambdas": (1.0, 1.0),
+        "node_budget": 4,
+        "max_depth": 2,
+        "frontier_width": 2,
+        "collect_dynamic_provenance": True,
+        "diagnostic_target_paths": [[1, 4]],
+    }
+
+    raw_tree = select_batched_eagle3_dynamic_trees(**common)[0]
+    exchanged_tree = select_batched_eagle3_dynamic_trees(
+        **common,
+        final_boundary_exchange_mode=(
+            "parent_supported_half_cutoff_one_swap_v1"
+        ),
+    )[0]
+
+    assert [node.token_id for node in raw_tree.nodes[1:]] == [1, 2, 3, 5]
+    assert [node.token_id for node in exchanged_tree.nodes[1:]] == [1, 2, 3, 4]
+    _assert_ancestor_closed(exchanged_tree)
+    provenance = exchanged_tree.dynamic_provenance
+    assert provenance is not None
+    exchange = provenance["final_boundary_exchange"]
+    assert exchange["exchanged"] is True
+    assert exchange["raw_score_floor_ratio"] == 0.5
+    assert exchange["eligible_candidate_count"] == 1
+    assert exchange["victim"]["parent_path_priority"] == pytest.approx(0.6)
+    assert exchange["promoted"]["parent_path_priority"] == pytest.approx(0.9)
+    canonical = provenance["canonical_target_path"]
+    assert canonical["raw_final_tree_retained_path_token_ids"] == [1]
+    assert canonical["raw_final_tree_retained_path_count"] == 1
+    assert canonical["retained_path_token_ids"] == [1, 4]
+    assert canonical["retained_path_count"] == 2
+
+
+def test_parent_supported_boundary_exchange_requires_stronger_parent() -> None:
+    root_tokens = torch.tensor([[1, 2]], dtype=torch.long)
+    root_probabilities = torch.tensor([[0.9, 0.6]])
+
+    tree = select_batched_eagle3_dynamic_trees(
+        root_states=[0],
+        root_candidate_tokens=root_tokens,
+        root_candidate_probabilities=root_probabilities,
+        candidate_batch_fn=lambda states: (
+            torch.tensor([[3, 4]] * len(states), dtype=torch.long),
+            torch.tensor([[0.5, 0.49]] * len(states)),
+        ),
+        transition_batch_fn=lambda states, token_ids: list(token_ids),
+        head_lambdas=(1.0, 1.0),
+        node_budget=3,
+        max_depth=2,
+        frontier_width=2,
+        collect_dynamic_provenance=True,
+        final_boundary_exchange_mode=(
+            "parent_supported_half_cutoff_one_swap_v1"
+        ),
+    )[0]
+
+    assert tree.dynamic_provenance is not None
+    assert tree.dynamic_provenance["final_boundary_exchange"]["exchanged"] is False
 
 
 def test_dynamic_union_provenance_tracks_final_node_sources() -> None:

@@ -1403,6 +1403,35 @@ def test_proposer_validates_runtime_tree_controls_without_model_reload():
         proposer.set_residual_tree_runtime_config(
             {"node_budget": 12, "max_depth": None}
         )
+    with pytest.raises(ValueError, match="unknown runtime final-boundary"):
+        proposer.set_residual_tree_runtime_config(
+            {"node_budget": 12, "final_boundary_exchange_mode": "unknown"}
+        )
+
+    b60_proposer = object.__new__(SpecDecodeBaseProposer)
+    b60_proposer.speculative_config = SimpleNamespace(
+        residual_tree=True,
+        num_speculative_tokens=60,
+        residual_tree_max_depth=8,
+        residual_tree_tree_policy="eagle3_dynamic",
+        residual_tree_scorer_mode="lambda_q",
+        residual_tree_scorer_top_k=10,
+    )
+    b60_proposer._residual_tree_runtime_config = {}
+    boundary_config = b60_proposer.set_residual_tree_runtime_config(
+        {
+            "node_budget": 60,
+            "max_depth": 8,
+            "tree_policy": "eagle3_dynamic",
+            "scorer_mode": "lambda_q",
+            "final_boundary_exchange_mode": (
+                "parent_supported_half_cutoff_one_swap_v1"
+            ),
+        }
+    )
+    assert boundary_config["final_boundary_exchange_mode"] == (
+        "parent_supported_half_cutoff_one_swap_v1"
+    )
 
     assert proposer.set_residual_tree_runtime_config(None) == {}
 

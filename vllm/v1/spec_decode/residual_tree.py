@@ -17,6 +17,9 @@ from vllm.v1.spec_decode.tree_schema import DraftTokenTree
 
 _EPS = 1e-12
 _BEST_FIRST_PREFETCH_LIMIT = 16
+_PARENT_SUPPORTED_BOUNDARY_EXCHANGE = (
+    "parent_supported_half_cutoff_one_swap_v1"
+)
 
 
 @triton.jit(do_not_specialize=["max_spec_len"])
@@ -1486,6 +1489,7 @@ def select_batched_eagle3_dynamic_trees(
     diagnostic_target_paths: Sequence[Sequence[int]] | None = None,
     frontier_h2_only_quota: int = 0,
     preserve_spine_count: int = 0,
+    final_boundary_exchange_mode: str = "none",
 ) -> list[ResidualTree]:
     """Build the released EAGLE-3 width-10, globally pruned tree.
 
@@ -1518,6 +1522,18 @@ def select_batched_eagle3_dynamic_trees(
         raise ValueError("dynamic H2-only frontier quota requires union provenance")
     if preserve_spine_count * max_depth > node_budget:
         raise ValueError("preserved dynamic spines do not fit the node budget")
+    if final_boundary_exchange_mode not in {
+        "none",
+        _PARENT_SUPPORTED_BOUNDARY_EXCHANGE,
+    }:
+        raise ValueError(
+            "unknown dynamic final-boundary exchange mode: "
+            f"{final_boundary_exchange_mode}"
+        )
+    if final_boundary_exchange_mode != "none" and preserve_spine_count:
+        raise ValueError(
+            "dynamic final-boundary exchange does not support preserved spines"
+        )
     if diagnostic_target_paths is not None:
         if not collect_dynamic_provenance:
             raise ValueError(
@@ -2098,6 +2114,101 @@ def select_batched_eagle3_dynamic_trees(
         else:
             selected_full_ids = sorted(global_priority_order[:node_budget])
         selected_set = set(selected_full_ids)
+        raw_selected_set = set(selected_full_ids)
+        boundary_exchange_diagnostic: dict[str, Any] = {
+            "mode": final_boundary_exchange_mode,
+            "exchanged": False,
+        }
+        if final_boundary_exchange_mode == _PARENT_SUPPORTED_BOUNDARY_EXCHANGE:
+            selected_parent_ids = {
+                generated_nodes[full_id].parent_id for full_id in selected_full_ids
+            }
+            selected_leaves = [
+                full_id
+                for full_id in selected_full_ids
+                if full_id not in selected_parent_ids
+            ]
+            if not selected_leaves:
+                raise RuntimeError(
+                    "dynamic final-boundary exchange found no selected leaf"
+                )
+            victim_id = min(
+                selected_leaves,
+                key=lambda full_id: (
+                    generated_nodes[full_id].priority,
+                    -full_id,
+                ),
+            )
+            victim = generated_nodes[victim_id]
+            victim_parent = generated_nodes[victim.parent_id]
+            raw_cutoff_priority = generated_nodes[
+                global_priority_order[node_budget - 1]
+            ].priority
+            minimum_priority = 0.5 * raw_cutoff_priority
+            eligible_ids = [
+                full_id
+                for full_id in global_priority_order[node_budget:]
+                if generated_nodes[full_id].priority >= minimum_priority
+                and generated_nodes[full_id].parent_id in selected_set | {0}
+                and generated_nodes[full_id].parent_id != victim_id
+            ]
+            promoted_id = (
+                min(
+                    eligible_ids,
+                    key=lambda full_id: (
+                        -generated_nodes[
+                            generated_nodes[full_id].parent_id
+                        ].priority,
+                        -generated_nodes[full_id].priority,
+                        full_id,
+                    ),
+                )
+                if eligible_ids
+                else None
+            )
+            promoted_parent_priority = (
+                generated_nodes[
+                    generated_nodes[promoted_id].parent_id
+                ].priority
+                if promoted_id is not None
+                else None
+            )
+            exchanged = bool(
+                promoted_id is not None
+                and promoted_parent_priority is not None
+                and promoted_parent_priority > victim_parent.priority
+            )
+            if exchanged:
+                selected_set.remove(victim_id)
+                selected_set.add(promoted_id)
+                selected_full_ids = sorted(selected_set)
+            boundary_exchange_diagnostic = {
+                "mode": final_boundary_exchange_mode,
+                "raw_cutoff_priority": raw_cutoff_priority,
+                "raw_score_floor_ratio": 0.5,
+                "eligible_candidate_count": len(eligible_ids),
+                "exchanged": exchanged,
+                "victim": {
+                    "full_node_id": victim_id,
+                    "parent_full_node_id": victim.parent_id,
+                    "depth": victim.depth,
+                    "path_priority": victim.priority,
+                    "parent_path_priority": victim_parent.priority,
+                },
+                "promoted": (
+                    {
+                        "full_node_id": promoted_id,
+                        "parent_full_node_id": generated_nodes[
+                            promoted_id
+                        ].parent_id,
+                        "depth": generated_nodes[promoted_id].depth,
+                        "path_priority": generated_nodes[promoted_id].priority,
+                        "parent_path_priority": promoted_parent_priority,
+                    }
+                    if promoted_id is not None
+                    else None
+                ),
+            }
         for full_id in selected_full_ids:
             parent_id = generated_nodes[full_id].parent_id
             if parent_id != 0 and parent_id not in selected_set:
@@ -2116,6 +2227,33 @@ def select_batched_eagle3_dynamic_trees(
                 for full_node_id in frontier
             ]
             continued_set = set(continued_full_ids)
+
+            def retained_target_prefix(
+                candidate_selected_set: set[int],
+            ) -> list[int]:
+                retained: list[int] = []
+                parent_full_id = 0
+                for child_depth, target_token_id in enumerate(
+                    target_path,
+                    start=1,
+                ):
+                    if child_depth > 1 and parent_full_id not in continued_set:
+                        break
+                    matching_children = [
+                        child_id
+                        for child_id in builder["children"][parent_full_id]
+                        if generated_nodes[child_id].token_id == target_token_id
+                    ]
+                    if not matching_children:
+                        break
+                    child_id = matching_children[0]
+                    if child_id not in candidate_selected_set:
+                        break
+                    retained.append(target_token_id)
+                    parent_full_id = child_id
+                return retained
+
+            raw_retained_token_ids = retained_target_prefix(raw_selected_set)
             global_ranks = {
                 node_id: rank
                 for rank, node_id in enumerate(global_priority_order, start=1)
@@ -2241,6 +2379,12 @@ def select_batched_eagle3_dynamic_trees(
                 )
             target_path_diagnostic = {
                 "target_token_ids": target_path,
+                "raw_final_tree_retained_path_token_ids": (
+                    raw_retained_token_ids
+                ),
+                "raw_final_tree_retained_path_count": len(
+                    raw_retained_token_ids
+                ),
                 "retained_path_token_ids": retained_token_ids,
                 "retained_path_count": len(retained_token_ids),
                 "stop_stage": stop_stage,
@@ -2321,6 +2465,7 @@ def select_batched_eagle3_dynamic_trees(
                 "frontier_width": frontier_width,
                 "frontier_h2_only_quota": frontier_h2_only_quota,
                 "preserve_spine_count": preserve_spine_count,
+                "final_boundary_exchange": boundary_exchange_diagnostic,
                 "generated_by_depth": summarize(range(1, len(generated_nodes))),
                 "continued_frontier_by_depth": summarize(continued_full_ids),
                 "final_tree_by_depth": summarize(selected_full_ids),

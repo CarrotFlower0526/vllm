@@ -870,6 +870,10 @@ class SpecDecodeBaseProposer:
                 ),
             )
         )
+        final_boundary_exchange_mode = runtime_config.get(
+            "final_boundary_exchange_mode",
+            "none",
+        )
         training_feature_dir = self._residual_tree_training_feature_dir
         probability_trace_dir = self._residual_tree_probability_trace_dir
         trace_enabled = bool(
@@ -982,8 +986,16 @@ class SpecDecodeBaseProposer:
                     target_ids[:, None]
                 )
                 below_one = torch.nextafter(
-                    torch.ones((), dtype=probabilities.dtype, device=probabilities.device),
-                    torch.zeros((), dtype=probabilities.dtype, device=probabilities.device),
+                    torch.ones(
+                        (),
+                        dtype=probabilities.dtype,
+                        device=probabilities.device,
+                    ),
+                    torch.zeros(
+                        (),
+                        dtype=probabilities.dtype,
+                        device=probabilities.device,
+                    ),
                 )
                 promoted = torch.where(
                     target_mask,
@@ -1050,6 +1062,7 @@ class SpecDecodeBaseProposer:
                     frontier_width=10,
                     collect_dynamic_provenance=trace_path is not None,
                     diagnostic_target_paths=diagnostic_target_paths,
+                    final_boundary_exchange_mode=final_boundary_exchange_mode,
                 )
             if diagnostic_target_metadata is not None:
                 for tree, metadata in zip(
@@ -2004,6 +2017,7 @@ class SpecDecodeBaseProposer:
             "greedy_scorer_path",
             "scorer_top_k",
             "trace_path",
+            "final_boundary_exchange_mode",
         }
         unknown = set(config) - allowed
         if unknown:
@@ -2116,6 +2130,31 @@ class SpecDecodeBaseProposer:
         trace_path = normalized.get("trace_path")
         if trace_path is not None and not isinstance(trace_path, str):
             raise TypeError("runtime trace path must be a string or None")
+
+        boundary_exchange = normalized.get(
+            "final_boundary_exchange_mode",
+            "none",
+        )
+        if boundary_exchange not in {
+            "none",
+            "parent_supported_half_cutoff_one_swap_v1",
+        }:
+            raise ValueError(
+                "unknown runtime final-boundary exchange mode: "
+                f"{boundary_exchange}"
+            )
+        if boundary_exchange != "none" and (
+            node_budget != 60
+            or max_depth != 8
+            or tree_policy != "eagle3_dynamic"
+            or scorer_mode != "lambda_q"
+        ):
+            raise ValueError(
+                "parent-supported final-boundary exchange requires raw B60D8 "
+                "eagle3_dynamic scoring"
+            )
+        if "final_boundary_exchange_mode" in normalized:
+            normalized["final_boundary_exchange_mode"] = boundary_exchange
 
         self._residual_tree_runtime_config = normalized
         return dict(normalized)
