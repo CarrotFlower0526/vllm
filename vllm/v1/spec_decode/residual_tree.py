@@ -1703,6 +1703,52 @@ def select_batched_eagle3_dynamic_trees(
             )
         return rows
 
+    def project_candidate_rows(
+        states: Sequence[Any],
+    ) -> list[
+        tuple[
+            list[int],
+            list[float],
+            list[int] | None,
+            list[int] | None,
+            list[int] | None,
+            list[int] | None,
+        ]
+    ]:
+        projected = candidate_batch_fn(states)
+        if (
+            not isinstance(projected, tuple)
+            or len(projected) not in (2, 6)
+            or not all(isinstance(value, torch.Tensor) for value in projected)
+        ):
+            raise TypeError(
+                "dynamic candidate callback must return token/probability tensors "
+                "and optional four-tensor provenance"
+            )
+        if (len(projected) == 6) != has_candidate_provenance:
+            raise ValueError(
+                "dynamic candidate provenance must be present at every depth"
+            )
+        projected_provenance = (
+            cast(
+                tuple[
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                ],
+                projected[2:],
+            )
+            if len(projected) == 6
+            else None
+        )
+        return compact_rows(
+            projected[0],
+            projected[1],
+            len(states),
+            projected_provenance,
+        )
+
     builders: list[dict[str, Any]] = []
     for root_state in root_states:
         builder = {
@@ -1714,6 +1760,7 @@ def select_batched_eagle3_dynamic_trees(
         if collect_dynamic_provenance:
             builder["continued_frontiers"] = []
             builder["union_sources"] = {}
+            builder["candidate_rows"] = {}
         if preserve_spine_count:
             builder["preserved_spines"] = []
         builders.append(builder)
@@ -1773,6 +1820,13 @@ def select_batched_eagle3_dynamic_trees(
         child_depth_lambdas = depth_lambda_values[parent.depth]
         child_ids = []
         token_row, probability_row, source_masks, h1_ranks, h2_ranks, score_heads = row
+        if collect_dynamic_provenance:
+            candidate_rows = builder["candidate_rows"]
+            if parent_id in candidate_rows:
+                raise AssertionError(
+                    "dynamic EAGLE-3 parent candidates were recorded twice"
+                )
+            candidate_rows[parent_id] = row
         for head_id, (token_id, probability) in enumerate(
             zip(token_row, probability_row, strict=True)
         ):
@@ -1862,39 +1916,7 @@ def select_batched_eagle3_dynamic_trees(
             raise ValueError(
                 "dynamic transition callback must return one state per frontier node"
             )
-        projected = candidate_batch_fn(transitioned)
-        if (
-            not isinstance(projected, tuple)
-            or len(projected) not in (2, 6)
-            or not all(isinstance(value, torch.Tensor) for value in projected)
-        ):
-            raise TypeError(
-                "dynamic candidate callback must return token/probability tensors "
-                "and optional four-tensor provenance"
-            )
-        if (len(projected) == 6) != has_candidate_provenance:
-            raise ValueError(
-                "dynamic candidate provenance must be present at every depth"
-            )
-        projected_provenance = (
-            cast(
-                tuple[
-                    torch.Tensor,
-                    torch.Tensor,
-                    torch.Tensor,
-                    torch.Tensor,
-                ],
-                projected[2:],
-            )
-            if len(projected) == 6
-            else None
-        )
-        rows = compact_rows(
-            projected[0],
-            projected[1],
-            len(transitioned),
-            projected_provenance,
-        )
+        rows = project_candidate_rows(transitioned)
 
         generated_by_builder: list[list[int]] = [[] for _ in builders]
         for (builder_index, node_id), state, row in zip(
@@ -1931,6 +1953,120 @@ def select_batched_eagle3_dynamic_trees(
             )
             if collect_dynamic_provenance and child_depth < max_depth:
                 builder["continued_frontiers"].append(list(builder["frontier"]))
+
+    if diagnostic_target_paths is not None:
+        for builder_index, builder in enumerate(builders):
+            target_path = [
+                int(token_id) for token_id in diagnostic_target_paths[builder_index]
+            ]
+            current_state = builder["states"][0]
+            parent_full_node_id: int | None = 0
+            parent_path_priority = 1.0
+            parent_path_token_ids: list[int] = []
+            candidate_states: list[dict[str, Any]] = []
+            for child_depth, target_token_id in enumerate(target_path, start=1):
+                recorded_row = (
+                    builder["candidate_rows"].get(parent_full_node_id)
+                    if parent_full_node_id is not None
+                    else None
+                )
+                if recorded_row is None:
+                    row = project_candidate_rows([current_state])[0]
+                    source = "canonical_spine_probe"
+                else:
+                    row = recorded_row
+                    source = "raw_tree_expansion"
+                (
+                    token_row,
+                    probability_row,
+                    source_masks,
+                    h1_ranks,
+                    h2_ranks,
+                    score_heads,
+                ) = row
+                child_depth_lambdas = depth_lambda_values[child_depth - 1]
+                entered_by_token: dict[int, int] = {}
+                if parent_full_node_id is not None:
+                    entered_by_token = {
+                        int(builder["nodes"][child_id].token_id): int(child_id)
+                        for child_id in builder["children"][parent_full_node_id]
+                    }
+                candidates = []
+                for head_id, (token_id, probability) in enumerate(
+                    zip(token_row, probability_row, strict=True)
+                ):
+                    candidate = {
+                        "head_id": head_id,
+                        "token_id": token_id,
+                        "proposal_probability": probability,
+                        "candidate_path_priority": (
+                            parent_path_priority
+                            * child_depth_lambdas[head_id]
+                            * probability
+                        ),
+                        "entered_full_node_id": entered_by_token.get(token_id),
+                    }
+                    if source_masks is not None:
+                        assert h1_ranks is not None
+                        assert h2_ranks is not None
+                        assert score_heads is not None
+                        candidate.update(
+                            {
+                                "source_mask": source_masks[head_id],
+                                "h1_rank": h1_ranks[head_id],
+                                "h2_rank": h2_ranks[head_id],
+                                "score_head_id": score_heads[head_id],
+                            }
+                        )
+                    candidates.append(candidate)
+                correct_head_id = next(
+                    (
+                        head_id
+                        for head_id, token_id in enumerate(token_row)
+                        if token_id == target_token_id
+                    ),
+                    None,
+                )
+                candidate_states.append(
+                    {
+                        "child_depth": child_depth,
+                        "parent_full_node_id": parent_full_node_id,
+                        "parent_path_token_ids": list(parent_path_token_ids),
+                        "parent_path_priority": parent_path_priority,
+                        "source": source,
+                        "correct_token_id": target_token_id,
+                        "correct_token_available": correct_head_id is not None,
+                        "correct_head_id": correct_head_id,
+                        "candidates": candidates,
+                    }
+                )
+                if correct_head_id is None:
+                    break
+
+                correct_probability = probability_row[correct_head_id]
+                parent_path_priority *= (
+                    child_depth_lambdas[correct_head_id] * correct_probability
+                )
+                parent_path_token_ids.append(target_token_id)
+                matching_child_id = entered_by_token.get(target_token_id)
+                matching_child_state = (
+                    builder["states"][matching_child_id]
+                    if matching_child_id is not None
+                    else None
+                )
+                if matching_child_state is None and child_depth < len(target_path):
+                    transitioned = list(
+                        transition_batch_fn([current_state], [target_token_id])
+                    )
+                    if len(transitioned) != 1:
+                        raise ValueError(
+                            "canonical-spine transition must return exactly one state"
+                        )
+                    current_state = transitioned[0]
+                elif matching_child_state is not None:
+                    current_state = matching_child_state
+                parent_full_node_id = matching_child_id
+            builder["canonical_spine_candidate_states"] = candidate_states
 
     trees: list[ResidualTree] = []
     for builder_index, builder in enumerate(builders):
@@ -1984,6 +2120,31 @@ def select_batched_eagle3_dynamic_trees(
                 node_id: rank
                 for rank, node_id in enumerate(global_priority_order, start=1)
             }
+            depth_ranks: dict[int, int] = {}
+            depth_cutoffs: dict[int, float] = {}
+            for depth in range(1, max_depth + 1):
+                ordered = sorted(
+                    (
+                        node.node_id
+                        for node in generated_nodes[1:]
+                        if node.depth == depth
+                    ),
+                    key=lambda node_id: (
+                        -generated_nodes[node_id].priority,
+                        node_id,
+                    ),
+                )
+                if not ordered:
+                    continue
+                depth_ranks.update(
+                    {
+                        node_id: rank
+                        for rank, node_id in enumerate(ordered, start=1)
+                    }
+                )
+                depth_cutoffs[depth] = generated_nodes[
+                    ordered[min(frontier_width, len(ordered)) - 1]
+                ].priority
             global_cutoff_priority = generated_nodes[
                 global_priority_order[node_budget - 1]
             ].priority
@@ -2049,6 +2210,8 @@ def select_batched_eagle3_dynamic_trees(
                     "proposal_probability": float(contributor.proposal_prob),
                     "path_priority": child.priority,
                     "global_priority_rank": global_ranks[child_id],
+                    "same_depth_generated_rank": depth_ranks[child_id],
+                    "same_depth_top10_cutoff_priority": depth_cutoffs[child_depth],
                     "continued_frontier": child_id in continued_set,
                     "final_tree": child_id in selected_set,
                 }
@@ -2061,6 +2224,10 @@ def select_batched_eagle3_dynamic_trees(
                         "candidate_full_node_id": child_id,
                         "candidate_path_priority": child.priority,
                         "candidate_global_priority_rank": global_ranks[child_id],
+                        "candidate_same_depth_generated_rank": depth_ranks[child_id],
+                        "same_depth_top10_cutoff_priority": depth_cutoffs[
+                            child_depth
+                        ],
                         "global_cutoff_priority": global_cutoff_priority,
                     }
                     break
@@ -2081,6 +2248,16 @@ def select_batched_eagle3_dynamic_trees(
                 "stop_token_id": stop_token_id,
                 "stop_details": stop_details,
                 "path_nodes": retained_nodes,
+                "fixed_candidate_oracle_path_count": sum(
+                    1
+                    for state in builder["canonical_spine_candidate_states"]
+                    if state["correct_token_available"]
+                ),
+                "fixed_candidate_oracle_token_ids": [
+                    int(state["correct_token_id"])
+                    for state in builder["canonical_spine_candidate_states"]
+                    if state["correct_token_available"]
+                ],
             }
 
         full_to_local = {0: 0}
@@ -2148,6 +2325,13 @@ def select_batched_eagle3_dynamic_trees(
                 "continued_frontier_by_depth": summarize(continued_full_ids),
                 "final_tree_by_depth": summarize(selected_full_ids),
             }
+            if diagnostic_target_paths is not None:
+                dynamic_provenance["canonical_spine_candidate_schema"] = (
+                    "ordered_distinct_heads_same_process_v1"
+                )
+                dynamic_provenance["canonical_spine_candidate_states"] = builder[
+                    "canonical_spine_candidate_states"
+                ]
             if preserve_spine_count:
                 dynamic_provenance["preserved_spines"] = [
                     [int(node_id) for node_id in spine]

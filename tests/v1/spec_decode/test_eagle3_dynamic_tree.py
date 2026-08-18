@@ -271,6 +271,22 @@ def test_canonical_target_path_diagnostic_separates_pruning_stages() -> None:
         local_tree.dynamic_provenance["canonical_target_path"]["stop_stage"]
         == "absent_after_local_width10"
     )
+    local_probe = local_tree.dynamic_provenance[
+        "canonical_spine_candidate_states"
+    ]
+    assert (
+        local_tree.dynamic_provenance["canonical_spine_candidate_schema"]
+        == "ordered_distinct_heads_same_process_v1"
+    )
+    assert len(local_probe) == 1
+    assert local_probe[0]["source"] == "raw_tree_expansion"
+    assert local_probe[0]["correct_token_available"] is False
+    assert [row["token_id"] for row in local_probe[0]["candidates"]] == [1, 2]
+    assert (
+        local_tree.dynamic_provenance["canonical_target_path"]
+        ["fixed_candidate_oracle_path_count"]
+        == 0
+    )
 
     budget_tree = select_batched_eagle3_dynamic_trees(
         root_states=[0],
@@ -289,6 +305,8 @@ def test_canonical_target_path_diagnostic_separates_pruning_stages() -> None:
     budget_diagnostic = budget_tree.dynamic_provenance["canonical_target_path"]
     assert budget_diagnostic["stop_stage"] == "final_node_budget_pruned"
     assert budget_diagnostic["stop_details"]["candidate_global_priority_rank"] == 2
+    assert budget_diagnostic["fixed_candidate_oracle_path_count"] == 1
+    assert budget_diagnostic["fixed_candidate_oracle_token_ids"] == [2]
 
     def second_depth_candidates(states):
         return (
@@ -314,6 +332,20 @@ def test_canonical_target_path_diagnostic_separates_pruning_stages() -> None:
     assert frontier_diagnostic["retained_path_token_ids"] == [2]
     assert frontier_diagnostic["stop_stage"] == "continued_frontier_pruned"
     assert frontier_diagnostic["stop_details"]["parent_frontier_rank"] == 2
+    assert frontier_diagnostic["fixed_candidate_oracle_path_count"] == 2
+    assert frontier_diagnostic["fixed_candidate_oracle_token_ids"] == [2, 3]
+    frontier_probe = frontier_tree.dynamic_provenance[
+        "canonical_spine_candidate_states"
+    ]
+    assert [row["source"] for row in frontier_probe] == [
+        "raw_tree_expansion",
+        "canonical_spine_probe",
+    ]
+    assert [row["parent_path_token_ids"] for row in frontier_probe] == [
+        [],
+        [2],
+    ]
+    assert [row["correct_head_id"] for row in frontier_probe] == [1, 0]
 
 
 def test_dynamic_h2_only_quota_keeps_a_residual_frontier_path() -> None:
