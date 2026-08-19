@@ -137,7 +137,6 @@ def _fp8_linear_may_use_deep_gemm(module: torch.nn.Module) -> bool:
 
     # FIXME: this logic is brittle and incorrect - since we
     # could use DeepGEMM with for than just Fp8LinearMethod
-    block_size = get_mk_alignment_for_contiguous_layout()[0]
     if not (
         isinstance(module, LinearBase)
         and isinstance(module.quant_method, Fp8LinearMethod)
@@ -147,6 +146,7 @@ def _fp8_linear_may_use_deep_gemm(module: torch.nn.Module) -> bool:
     ):
         return False
 
+    block_size = get_mk_alignment_for_contiguous_layout()[0]
     w, _, block_sizes = _extract_data_from_linear_base_module(module)
     return (
         block_sizes == get_mk_alignment_for_contiguous_layout()
