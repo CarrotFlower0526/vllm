@@ -303,6 +303,7 @@ def test_selectable_mass_is_traced_without_changing_raw_tree() -> None:
         "frontier_width": 10,
         "collect_dynamic_provenance": True,
         "diagnostic_target_paths": [[1, 101, 10101]],
+        "compact_candidate_pool_trace": True,
     }
     raw_tree = select_batched_eagle3_dynamic_trees(
         **(common | {"candidate_batch_fn": lambda states: candidates(states)[:2]})
@@ -317,6 +318,9 @@ def test_selectable_mass_is_traced_without_changing_raw_tree() -> None:
     ] == [(node.parent_id, node.token_id, node.priority) for node in raw_tree.nodes]
     provenance = mass_tree.dynamic_provenance
     assert provenance is not None
+    raw_pool = raw_tree.dynamic_provenance["compact_candidate_pool"]
+    assert raw_pool["schema"] == "ordered_h10_raw_candidate_pool_v1"
+    assert "selectable_mass_estimate" not in raw_pool["columns"]
     pool = provenance["selectable_mass_candidate_pool"]
     assert pool["tree_scoring_changed"] is False
     assert pool["frontier_selection_changed"] is False

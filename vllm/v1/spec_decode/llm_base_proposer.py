@@ -874,6 +874,10 @@ class SpecDecodeBaseProposer:
             "final_boundary_exchange_mode",
             "none",
         )
+        compact_candidate_pool_trace = runtime_config.get(
+            "compact_candidate_pool_trace",
+            False,
+        )
         training_feature_dir = self._residual_tree_training_feature_dir
         probability_trace_dir = self._residual_tree_probability_trace_dir
         trace_enabled = bool(
@@ -1065,6 +1069,7 @@ class SpecDecodeBaseProposer:
                     collect_dynamic_provenance=trace_path is not None,
                     diagnostic_target_paths=diagnostic_target_paths,
                     final_boundary_exchange_mode=final_boundary_exchange_mode,
+                    compact_candidate_pool_trace=compact_candidate_pool_trace,
                 )
             if diagnostic_target_metadata is not None:
                 for tree, metadata in zip(
@@ -2027,6 +2032,7 @@ class SpecDecodeBaseProposer:
             "scorer_top_k",
             "trace_path",
             "final_boundary_exchange_mode",
+            "compact_candidate_pool_trace",
         }
         unknown = set(config) - allowed
         if unknown:
@@ -2140,6 +2146,13 @@ class SpecDecodeBaseProposer:
         if trace_path is not None and not isinstance(trace_path, str):
             raise TypeError("runtime trace path must be a string or None")
 
+        compact_candidate_pool_trace = normalized.get(
+            "compact_candidate_pool_trace",
+            False,
+        )
+        if not isinstance(compact_candidate_pool_trace, bool):
+            raise TypeError("runtime compact_candidate_pool_trace must be a boolean")
+
         boundary_exchange = normalized.get(
             "final_boundary_exchange_mode",
             "none",
@@ -2163,6 +2176,28 @@ class SpecDecodeBaseProposer:
             )
         if "final_boundary_exchange_mode" in normalized:
             normalized["final_boundary_exchange_mode"] = boundary_exchange
+
+        if compact_candidate_pool_trace and (
+            not trace_path
+            or node_budget != 60
+            or max_depth != 8
+            or tree_policy != "eagle3_dynamic"
+            or scorer_mode != "lambda_q"
+            or boundary_exchange != "none"
+            or getattr(
+                self.speculative_config,
+                "residual_tree_candidate_selection",
+                None,
+            )
+            != "distinct_head_top1"
+        ):
+            raise ValueError(
+                "compact candidate-pool tracing requires raw B60D8 "
+                "eagle3_dynamic scoring, distinct ordered heads, a trace "
+                "path, and no final-boundary exchange"
+        )
+        if "compact_candidate_pool_trace" in normalized:
+            normalized["compact_candidate_pool_trace"] = compact_candidate_pool_trace
 
         self._residual_tree_runtime_config = normalized
         return dict(normalized)

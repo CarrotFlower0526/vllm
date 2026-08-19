@@ -1491,6 +1491,7 @@ def select_batched_eagle3_dynamic_trees(
     frontier_h2_only_quota: int = 0,
     preserve_spine_count: int = 0,
     final_boundary_exchange_mode: str = "none",
+    compact_candidate_pool_trace: bool = False,
 ) -> list[ResidualTree]:
     """Build the released EAGLE-3 width-10, globally pruned tree.
 
@@ -1534,6 +1535,15 @@ def select_batched_eagle3_dynamic_trees(
     if final_boundary_exchange_mode != "none" and preserve_spine_count:
         raise ValueError(
             "dynamic final-boundary exchange does not support preserved spines"
+        )
+    if not isinstance(compact_candidate_pool_trace, bool):
+        raise TypeError("compact candidate-pool trace control must be a boolean")
+    if compact_candidate_pool_trace and (
+        not collect_dynamic_provenance or diagnostic_target_paths is None
+    ):
+        raise ValueError(
+            "compact candidate-pool tracing requires dynamic provenance and "
+            "canonical target paths"
         )
     if diagnostic_target_paths is not None:
         if not collect_dynamic_provenance:
@@ -2520,19 +2530,33 @@ def select_batched_eagle3_dynamic_trees(
                 ]
             if target_path_diagnostic is not None:
                 dynamic_provenance["canonical_target_path"] = target_path_diagnostic
-            mass_contributors = [
-                node.contributors[0]
-                for node in generated_nodes[1:]
-                if len(node.contributors) == 1
-            ]
-            if mass_contributors and all(
-                contributor.selectable_mass is not None
-                for contributor in mass_contributors
-            ):
+            if compact_candidate_pool_trace:
                 if diagnostic_target_paths is None:
-                    raise ValueError(
-                        "selectable-mass candidate-pool tracing requires a "
-                        "canonical target path"
+                    raise AssertionError(
+                        "compact candidate-pool trace lost its target path"
+                    )
+                contributors = []
+                for node in generated_nodes[1:]:
+                    if len(node.contributors) != 1:
+                        raise AssertionError(
+                            "compact candidate pool requires one head per "
+                            "generated node"
+                        )
+                    contributors.append(node.contributors[0])
+                has_selectable_mass = bool(contributors) and all(
+                    contributor.selectable_mass is not None
+                    for contributor in contributors
+                )
+                if (
+                    any(
+                        contributor.selectable_mass is not None
+                        for contributor in contributors
+                    )
+                    and not has_selectable_mass
+                ):
+                    raise AssertionError(
+                        "selectable-mass predictions must cover the complete "
+                        "candidate pool"
                     )
                 target_path = [
                     int(token_id) for token_id in diagnostic_target_paths[builder_index]
@@ -2559,32 +2583,30 @@ def select_batched_eagle3_dynamic_trees(
                     node_id: rank
                     for rank, node_id in enumerate(global_priority_order, start=1)
                 }
-                columns: dict[str, list[Any]] = {
+                raw_columns: dict[str, list[Any]] = {
                     "full_node_id": [],
                     "parent_full_node_id": [],
                     "token_id": [],
                     "depth": [],
                     "head_id": [],
                     "proposal_probability": [],
-                    "selectable_mass_estimate": [],
-                    "absolute_edge_probability_estimate": [],
                     "raw_path_priority": [],
-                    "mass_adjusted_path_priority": [],
                     "parent_raw_path_priority": [],
                     "flags": [],
                     "raw_global_rank": [],
                 }
+                mass_columns = dict(raw_columns)
+                if has_selectable_mass:
+                    mass_columns.update(
+                        {
+                            "selectable_mass_estimate": [],
+                            "absolute_edge_probability_estimate": [],
+                            "mass_adjusted_path_priority": [],
+                        }
+                    )
                 continued_set = set(continued_full_ids)
                 for source in generated_nodes[1:]:
-                    if len(source.contributors) != 1:
-                        raise AssertionError(
-                            "selectable-mass candidate pool requires one head "
-                            "per generated node"
-                        )
                     contributor = source.contributors[0]
-                    mass = contributor.selectable_mass
-                    if mass is None:
-                        raise AssertionError("selectable-mass prediction disappeared")
                     parent_correct = source.parent_id in correct_parent_ids
                     target_available = source.depth <= len(target_path)
                     edge_correct = bool(
@@ -2601,43 +2623,63 @@ def select_batched_eagle3_dynamic_trees(
                         | (int(source.node_id in raw_selected_set) << 5)
                         | (int(source.node_id in raw_leaf_ids) << 6)
                     )
-                    absolute_edge_probability = mass * contributor.proposal_prob
                     parent_priority = generated_nodes[source.parent_id].priority
-                    columns["full_node_id"].append(source.node_id)
-                    columns["parent_full_node_id"].append(source.parent_id)
-                    columns["token_id"].append(source.token_id)
-                    columns["depth"].append(source.depth)
-                    columns["head_id"].append(contributor.head_id)
-                    columns["proposal_probability"].append(contributor.proposal_prob)
-                    columns["selectable_mass_estimate"].append(mass)
-                    columns["absolute_edge_probability_estimate"].append(
-                        absolute_edge_probability
+                    raw_columns["full_node_id"].append(source.node_id)
+                    raw_columns["parent_full_node_id"].append(source.parent_id)
+                    raw_columns["token_id"].append(source.token_id)
+                    raw_columns["depth"].append(source.depth)
+                    raw_columns["head_id"].append(contributor.head_id)
+                    raw_columns["proposal_probability"].append(
+                        contributor.proposal_prob
                     )
-                    columns["raw_path_priority"].append(source.priority)
-                    columns["mass_adjusted_path_priority"].append(
-                        parent_priority
-                        * contributor.lambda_weight
-                        * absolute_edge_probability
+                    raw_columns["raw_path_priority"].append(source.priority)
+                    raw_columns["parent_raw_path_priority"].append(parent_priority)
+                    raw_columns["flags"].append(flags)
+                    raw_columns["raw_global_rank"].append(
+                        raw_global_ranks[source.node_id]
                     )
-                    columns["parent_raw_path_priority"].append(parent_priority)
-                    columns["flags"].append(flags)
-                    columns["raw_global_rank"].append(raw_global_ranks[source.node_id])
-                dynamic_provenance["selectable_mass_candidate_pool"] = {
-                    "schema": "ordered_h10_selectable_mass_candidate_pool_v1",
+                    if has_selectable_mass:
+                        mass = contributor.selectable_mass
+                        if mass is None:
+                            raise AssertionError(
+                                "selectable-mass prediction disappeared"
+                            )
+                        absolute_edge_probability = mass * contributor.proposal_prob
+                        mass_columns["selectable_mass_estimate"].append(mass)
+                        mass_columns["absolute_edge_probability_estimate"].append(
+                            absolute_edge_probability
+                        )
+                        mass_columns["mass_adjusted_path_priority"].append(
+                            parent_priority
+                            * contributor.lambda_weight
+                            * absolute_edge_probability
+                        )
+                flag_bits = {
+                    "target_available": 0,
+                    "parent_path_correct": 1,
+                    "edge_correct_given_parent": 2,
+                    "path_correct": 3,
+                    "continued_frontier": 4,
+                    "raw_final_tree": 5,
+                    "raw_final_leaf": 6,
+                }
+                dynamic_provenance["compact_candidate_pool"] = {
+                    "schema": "ordered_h10_raw_candidate_pool_v1",
                     "row_count": len(generated_nodes) - 1,
                     "tree_scoring_changed": False,
                     "frontier_selection_changed": False,
-                    "flag_bits": {
-                        "target_available": 0,
-                        "parent_path_correct": 1,
-                        "edge_correct_given_parent": 2,
-                        "path_correct": 3,
-                        "continued_frontier": 4,
-                        "raw_final_tree": 5,
-                        "raw_final_leaf": 6,
-                    },
-                    "columns": columns,
+                    "flag_bits": flag_bits,
+                    "columns": raw_columns,
                 }
+                if has_selectable_mass:
+                    dynamic_provenance["selectable_mass_candidate_pool"] = {
+                        "schema": ("ordered_h10_selectable_mass_candidate_pool_v1"),
+                        "row_count": len(generated_nodes) - 1,
+                        "tree_scoring_changed": False,
+                        "frontier_selection_changed": False,
+                        "flag_bits": flag_bits,
+                        "columns": mass_columns,
+                    }
             union_sources: dict[int, dict[str, int]] = builder["union_sources"]
             if union_sources:
 

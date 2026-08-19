@@ -1414,6 +1414,7 @@ def test_proposer_validates_runtime_tree_controls_without_model_reload():
         num_speculative_tokens=60,
         residual_tree_max_depth=8,
         residual_tree_tree_policy="eagle3_dynamic",
+        residual_tree_candidate_selection="distinct_head_top1",
         residual_tree_scorer_mode="lambda_q",
         residual_tree_scorer_top_k=10,
     )
@@ -1432,6 +1433,26 @@ def test_proposer_validates_runtime_tree_controls_without_model_reload():
     assert boundary_config["final_boundary_exchange_mode"] == (
         "parent_supported_half_cutoff_one_swap_v1"
     )
+
+    compact_config = b60_proposer.set_residual_tree_runtime_config(
+        {
+            "node_budget": 60,
+            "max_depth": 8,
+            "tree_policy": "eagle3_dynamic",
+            "scorer_mode": "lambda_q",
+            "trace_path": "/tmp/b60_d8.jsonl",
+            "compact_candidate_pool_trace": True,
+        }
+    )
+    assert compact_config["compact_candidate_pool_trace"] is True
+    with pytest.raises(TypeError, match="compact_candidate_pool_trace"):
+        b60_proposer.set_residual_tree_runtime_config(
+            {"compact_candidate_pool_trace": 1}
+        )
+    with pytest.raises(ValueError, match="compact candidate-pool tracing"):
+        b60_proposer.set_residual_tree_runtime_config(
+            {"compact_candidate_pool_trace": True}
+        )
 
     assert proposer.set_residual_tree_runtime_config(None) == {}
 
