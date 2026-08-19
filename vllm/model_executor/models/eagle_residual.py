@@ -490,6 +490,17 @@ class ResidualTreeHeadMixin:
                     f"{dtype}, got {depth_bias.dtype}"
                 )
         adapters.load_state_dict(state)
+        if selectable_mass_weight is not None:
+            assert selectable_mass_bias is not None
+            adapter_reference = next(adapters.parameters())
+            selectable_mass_weight = selectable_mass_weight.to(
+                device=adapter_reference.device,
+                dtype=adapter_reference.dtype,
+            ).contiguous()
+            selectable_mass_bias = selectable_mass_bias.to(
+                device=adapter_reference.device,
+                dtype=adapter_reference.dtype,
+            ).contiguous()
         if (
             output_mode == "independent_lm_head"
             and self.residual_tree_freeze_base_head
