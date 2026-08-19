@@ -293,7 +293,7 @@ def test_fused_ordered_low_rank_heads_match_reference() -> None:
     assert torch.equal(fused_probabilities, reference_probabilities)
 
 
-def test_selectable_mass_rows_share_the_packed_head_projection() -> None:
+def test_selectable_mass_projection_preserves_packed_head_outputs() -> None:
     model = _OrderedFourHeadLowRankResidualModel()
     hidden_states = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
     raw_tokens, raw_probabilities = model.compute_residual_greedy_candidates(
@@ -303,12 +303,8 @@ def test_selectable_mass_rows_share_the_packed_head_projection() -> None:
     assert packed_in is not None
     mass_weight = torch.zeros((3, 4), dtype=packed_in.dtype)
     mass_bias = torch.tensor([0.0, -1.0, 1.0], dtype=packed_in.dtype)
-    model._residual_tree_packed_logit_and_mass_in_weight = torch.cat(
-        (packed_in, mass_weight), dim=0
-    )
-    model._residual_tree_packed_logit_and_mass_in_bias = mass_bias
-    model.residual_tree_selectable_mass_weight = None
-    model.residual_tree_selectable_mass_bias = None
+    model.residual_tree_selectable_mass_weight = mass_weight
+    model.residual_tree_selectable_mass_bias = mass_bias
     tokens, probabilities, selectable_mass = model.compute_residual_greedy_candidates(
         hidden_states,
         return_selectable_mass=True,
