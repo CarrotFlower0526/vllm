@@ -131,9 +131,7 @@ class _OrderedFourHeadLowRankResidualModel(_OrderedFourHeadResidualModel):
             packed_out_rows.append(adapter[2].weight)
         self.residual_tree_adapters = adapters
         self._residual_tree_packed_independent_weight = None
-        self._residual_tree_packed_logit_in_weight = torch.cat(
-            packed_in_rows, dim=0
-        )
+        self._residual_tree_packed_logit_in_weight = torch.cat(packed_in_rows, dim=0)
         self._residual_tree_packed_logit_out_weight = torch.stack(
             packed_out_rows, dim=0
         )
@@ -229,8 +227,8 @@ def test_state_candidate_mass_calibration_scales_only_later_heads() -> None:
 
     model.residual_tree_state_candidate_calibration_weight = None
     model.residual_tree_state_candidate_calibration_bias = None
-    reference_tokens, reference_probabilities = model.compute_residual_greedy_candidates(
-        hidden_states
+    reference_tokens, reference_probabilities = (
+        model.compute_residual_greedy_candidates(hidden_states)
     )
     model.residual_tree_state_candidate_calibration_weight = torch.zeros((3, 4))
     model.residual_tree_state_candidate_calibration_bias = torch.tensor(
@@ -242,10 +240,7 @@ def test_state_candidate_mass_calibration_scales_only_later_heads() -> None:
     assert torch.equal(tokens, reference_tokens)
     assert probabilities[:, 0].equal(reference_probabilities[:, 0])
     assert probabilities[:, 1:].tolist()[0] == pytest.approx(
-        (
-            reference_probabilities[:, 1:]
-            * torch.tensor([[0.5, 0.25, 0.75]])
-        ).tolist()[0]
+        (reference_probabilities[:, 1:] * torch.tensor([[0.5, 0.25, 0.75]])).tolist()[0]
     )
 
 
@@ -253,9 +248,7 @@ def test_fused_ordered_heads_match_reference_with_packed_linear_weights() -> Non
     model = _OrderedFourHeadResidualModel()
     hidden_states = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
     later_logits = [adapter.logits[0] for adapter in model.residual_tree_adapters]
-    linear_adapters = nn.ModuleList(
-        [nn.Linear(4, 5, bias=False) for _ in later_logits]
-    )
+    linear_adapters = nn.ModuleList([nn.Linear(4, 5, bias=False) for _ in later_logits])
     with torch.no_grad():
         for adapter, logits in zip(linear_adapters, later_logits, strict=True):
             adapter.weight.zero_()
@@ -298,6 +291,40 @@ def test_fused_ordered_low_rank_heads_match_reference() -> None:
 
     assert torch.equal(fused_tokens, reference_tokens)
     assert torch.equal(fused_probabilities, reference_probabilities)
+
+
+def test_selectable_mass_rows_share_the_packed_head_projection() -> None:
+    model = _OrderedFourHeadLowRankResidualModel()
+    hidden_states = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    raw_tokens, raw_probabilities = model.compute_residual_greedy_candidates(
+        hidden_states
+    )
+    packed_in = model._residual_tree_packed_logit_in_weight
+    assert packed_in is not None
+    mass_weight = torch.zeros((3, 4), dtype=packed_in.dtype)
+    mass_bias = torch.tensor([0.0, -1.0, 1.0], dtype=packed_in.dtype)
+    model._residual_tree_packed_logit_and_mass_in_weight = torch.cat(
+        (packed_in, mass_weight), dim=0
+    )
+    model._residual_tree_packed_logit_and_mass_in_bias = mass_bias
+    model.residual_tree_selectable_mass_weight = None
+    model.residual_tree_selectable_mass_bias = None
+    tokens, probabilities, selectable_mass = model.compute_residual_greedy_candidates(
+        hidden_states,
+        return_selectable_mass=True,
+    )
+
+    assert torch.equal(tokens, raw_tokens)
+    assert torch.equal(probabilities, raw_probabilities)
+    assert selectable_mass.shape == (1, 4)
+    assert selectable_mass[0].tolist() == pytest.approx(
+        [
+            1.0,
+            0.5,
+            torch.sigmoid(torch.tensor(-1.0)).item(),
+            torch.sigmoid(torch.tensor(1.0)).item(),
+        ]
+    )
 
 
 def test_stock_top2_projects_h1_once_without_adapter_or_fp32(
@@ -511,9 +538,7 @@ def test_hybrid_union_uses_per_depth_clipped_mass_calibration() -> None:
     h1_probability = torch.softmax(model._base_draft_logits.float(), dim=-1)[0, 0]
     h2_probability = torch.softmax(h2_logits.float(), dim=-1)[0, 0]
     expected_shared_score = 0.1 * h1_probability + 0.05 * h2_probability
-    assert scores[0, token0_index].item() == pytest.approx(
-        expected_shared_score.item()
-    )
+    assert scores[0, token0_index].item() == pytest.approx(expected_shared_score.item())
     assert source_masks[0, token0_index].item() == 3
 
     with pytest.raises(ValueError, match="requires tree_depth"):

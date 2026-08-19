@@ -17,9 +17,7 @@ from vllm.v1.spec_decode.tree_schema import DraftTokenTree
 
 _EPS = 1e-12
 _BEST_FIRST_PREFETCH_LIMIT = 16
-_PARENT_SUPPORTED_BOUNDARY_EXCHANGE = (
-    "parent_supported_half_cutoff_one_swap_v1"
-)
+_PARENT_SUPPORTED_BOUNDARY_EXCHANGE = "parent_supported_half_cutoff_one_swap_v1"
 
 
 @triton.jit(do_not_specialize=["max_spec_len"])
@@ -191,6 +189,7 @@ class TreeCandidateContributor:
     proposal_prob: float
     lambda_weight: float
     score: float
+    selectable_mass: float | None = None
 
 
 @dataclass(frozen=True)
@@ -305,6 +304,7 @@ ProposalBatchFn = Callable[[Sequence[Any]], Sequence[Sequence[torch.Tensor]]]
 TransitionBatchFn = Callable[[Sequence[Any], Sequence[int]], Sequence[Any]]
 CompactCandidateBatchOutput = (
     tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     | tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1471,6 +1471,7 @@ def select_batched_eagle3_dynamic_trees(
     root_states: Sequence[Any],
     root_candidate_tokens: torch.Tensor,
     root_candidate_probabilities: torch.Tensor,
+    root_candidate_selectable_masses: torch.Tensor | None = None,
     candidate_batch_fn: CompactCandidateBatchFn,
     transition_batch_fn: TransitionBatchFn,
     head_lambdas: torch.Tensor | Sequence[float],
@@ -1589,22 +1590,20 @@ def select_batched_eagle3_dynamic_trees(
                 "[max_depth, candidate_width]"
             )
         depth_lambda_values = [
-            [float(value) for value in row]
-            for row in depth_lambdas.tolist()
+            [float(value) for value in row] for row in depth_lambdas.tolist()
         ]
         if any(
             not math.isfinite(value) or value <= 0.0 or value > 1.0
             for row in depth_lambda_values
             for value in row
         ):
-            raise ValueError(
-                "dynamic depth-head lambdas must be finite and in (0, 1]"
-            )
+            raise ValueError("dynamic depth-head lambdas must be finite and in (0, 1]")
 
     def compact_rows(
         tokens: torch.Tensor,
         probabilities: torch.Tensor,
         expected_batch: int,
+        selectable_masses: torch.Tensor | None = None,
         provenance: tuple[
             torch.Tensor,
             torch.Tensor,
@@ -1616,6 +1615,7 @@ def select_batched_eagle3_dynamic_trees(
         tuple[
             list[int],
             list[float],
+            list[float] | None,
             list[int] | None,
             list[int] | None,
             list[int] | None,
@@ -1634,6 +1634,12 @@ def select_batched_eagle3_dynamic_trees(
             tokens.to(dtype=torch.float64),
             probabilities.to(dtype=torch.float64),
         ]
+        if selectable_masses is not None:
+            if selectable_masses.shape != tokens.shape:
+                raise ValueError(
+                    "dynamic selectable-mass predictions must match candidates"
+                )
+            tensors.append(selectable_masses.to(dtype=torch.float64))
         if provenance is not None:
             if not collect_dynamic_provenance:
                 raise ValueError(
@@ -1666,6 +1672,21 @@ def select_batched_eagle3_dynamic_trees(
                 raise ValueError(
                     "dynamic EAGLE-3 candidate probabilities must be in (0, 1]"
                 )
+            selectable_mass_row = None
+            metadata_start = 2
+            if selectable_masses is not None:
+                selectable_mass_row = [
+                    float(value)
+                    for value in packet_row[2 * candidate_width : 3 * candidate_width]
+                ]
+                if any(
+                    not math.isfinite(value) or value <= 0.0 or value > 1.0
+                    for value in selectable_mass_row
+                ):
+                    raise ValueError(
+                        "dynamic selectable-mass predictions must be in (0, 1]"
+                    )
+                metadata_start = 3
             source_masks = h1_ranks = h2_ranks = score_heads = None
             if provenance is not None:
                 metadata_rows = [
@@ -1675,7 +1696,7 @@ def select_batched_eagle3_dynamic_trees(
                             column * candidate_width : (column + 1) * candidate_width
                         ]
                     ]
-                    for column in range(2, 6)
+                    for column in range(metadata_start, metadata_start + 4)
                 ]
                 source_masks, h1_ranks, h2_ranks, score_heads = metadata_rows
                 for index, (source_mask, h1_rank, h2_rank, score_head) in enumerate(
@@ -1711,6 +1732,7 @@ def select_batched_eagle3_dynamic_trees(
                 (
                     token_row,
                     probability_row,
+                    selectable_mass_row,
                     source_masks,
                     h1_ranks,
                     h2_ranks,
@@ -1725,6 +1747,7 @@ def select_batched_eagle3_dynamic_trees(
         tuple[
             list[int],
             list[float],
+            list[float] | None,
             list[int] | None,
             list[int] | None,
             list[int] | None,
@@ -1734,7 +1757,7 @@ def select_batched_eagle3_dynamic_trees(
         projected = candidate_batch_fn(states)
         if (
             not isinstance(projected, tuple)
-            or len(projected) not in (2, 6)
+            or len(projected) not in (2, 3, 6)
             or not all(isinstance(value, torch.Tensor) for value in projected)
         ):
             raise TypeError(
@@ -1758,10 +1781,12 @@ def select_batched_eagle3_dynamic_trees(
             if len(projected) == 6
             else None
         )
+        projected_selectable_mass = projected[2] if len(projected) == 3 else None
         return compact_rows(
             projected[0],
             projected[1],
             len(states),
+            projected_selectable_mass,
             projected_provenance,
         )
 
@@ -1823,6 +1848,7 @@ def select_batched_eagle3_dynamic_trees(
         row: tuple[
             list[int],
             list[float],
+            list[float] | None,
             list[int] | None,
             list[int] | None,
             list[int] | None,
@@ -1835,7 +1861,15 @@ def select_batched_eagle3_dynamic_trees(
         parent = nodes[parent_id]
         child_depth_lambdas = depth_lambda_values[parent.depth]
         child_ids = []
-        token_row, probability_row, source_masks, h1_ranks, h2_ranks, score_heads = row
+        (
+            token_row,
+            probability_row,
+            selectable_mass_row,
+            source_masks,
+            h1_ranks,
+            h2_ranks,
+            score_heads,
+        ) = row
         if collect_dynamic_provenance:
             candidate_rows = builder["candidate_rows"]
             if parent_id in candidate_rows:
@@ -1856,6 +1890,11 @@ def select_batched_eagle3_dynamic_trees(
                 proposal_prob=probability,
                 lambda_weight=lambda_weight,
                 score=priority,
+                selectable_mass=(
+                    selectable_mass_row[head_id]
+                    if selectable_mass_row is not None
+                    else None
+                ),
             )
             nodes.append(
                 ResidualTreeNode(
@@ -1887,6 +1926,7 @@ def select_batched_eagle3_dynamic_trees(
         root_candidate_tokens,
         root_candidate_probabilities,
         len(root_states),
+        root_candidate_selectable_masses,
         root_candidate_provenance,
     )
     for builder, row in zip(builders, root_rows, strict=True):
@@ -1995,6 +2035,7 @@ def select_batched_eagle3_dynamic_trees(
                 (
                     token_row,
                     probability_row,
+                    selectable_mass_row,
                     source_masks,
                     h1_ranks,
                     h2_ranks,
@@ -2015,6 +2056,16 @@ def select_batched_eagle3_dynamic_trees(
                         "head_id": head_id,
                         "token_id": token_id,
                         "proposal_probability": probability,
+                        "selectable_mass_estimate": (
+                            selectable_mass_row[head_id]
+                            if selectable_mass_row is not None
+                            else None
+                        ),
+                        "absolute_edge_probability_estimate": (
+                            selectable_mass_row[head_id] * probability
+                            if selectable_mass_row is not None
+                            else None
+                        ),
                         "candidate_path_priority": (
                             parent_path_priority
                             * child_depth_lambdas[head_id]
@@ -2156,9 +2207,7 @@ def select_batched_eagle3_dynamic_trees(
                 min(
                     eligible_ids,
                     key=lambda full_id: (
-                        -generated_nodes[
-                            generated_nodes[full_id].parent_id
-                        ].priority,
+                        -generated_nodes[generated_nodes[full_id].parent_id].priority,
                         -generated_nodes[full_id].priority,
                         full_id,
                     ),
@@ -2167,9 +2216,7 @@ def select_batched_eagle3_dynamic_trees(
                 else None
             )
             promoted_parent_priority = (
-                generated_nodes[
-                    generated_nodes[promoted_id].parent_id
-                ].priority
+                generated_nodes[generated_nodes[promoted_id].parent_id].priority
                 if promoted_id is not None
                 else None
             )
@@ -2198,9 +2245,7 @@ def select_batched_eagle3_dynamic_trees(
                 "promoted": (
                     {
                         "full_node_id": promoted_id,
-                        "parent_full_node_id": generated_nodes[
-                            promoted_id
-                        ].parent_id,
+                        "parent_full_node_id": generated_nodes[promoted_id].parent_id,
                         "depth": generated_nodes[promoted_id].depth,
                         "path_priority": generated_nodes[promoted_id].priority,
                         "parent_path_priority": promoted_parent_priority,
@@ -2275,10 +2320,7 @@ def select_batched_eagle3_dynamic_trees(
                 if not ordered:
                     continue
                 depth_ranks.update(
-                    {
-                        node_id: rank
-                        for rank, node_id in enumerate(ordered, start=1)
-                    }
+                    {node_id: rank for rank, node_id in enumerate(ordered, start=1)}
                 )
                 depth_cutoffs[depth] = generated_nodes[
                     ordered[min(frontier_width, len(ordered)) - 1]
@@ -2363,9 +2405,7 @@ def select_batched_eagle3_dynamic_trees(
                         "candidate_path_priority": child.priority,
                         "candidate_global_priority_rank": global_ranks[child_id],
                         "candidate_same_depth_generated_rank": depth_ranks[child_id],
-                        "same_depth_top10_cutoff_priority": depth_cutoffs[
-                            child_depth
-                        ],
+                        "same_depth_top10_cutoff_priority": depth_cutoffs[child_depth],
                         "global_cutoff_priority": global_cutoff_priority,
                     }
                     break
@@ -2379,12 +2419,8 @@ def select_batched_eagle3_dynamic_trees(
                 )
             target_path_diagnostic = {
                 "target_token_ids": target_path,
-                "raw_final_tree_retained_path_token_ids": (
-                    raw_retained_token_ids
-                ),
-                "raw_final_tree_retained_path_count": len(
-                    raw_retained_token_ids
-                ),
+                "raw_final_tree_retained_path_token_ids": (raw_retained_token_ids),
+                "raw_final_tree_retained_path_count": len(raw_retained_token_ids),
                 "retained_path_token_ids": retained_token_ids,
                 "retained_path_count": len(retained_token_ids),
                 "stop_stage": stop_stage,
@@ -2484,6 +2520,124 @@ def select_batched_eagle3_dynamic_trees(
                 ]
             if target_path_diagnostic is not None:
                 dynamic_provenance["canonical_target_path"] = target_path_diagnostic
+            mass_contributors = [
+                node.contributors[0]
+                for node in generated_nodes[1:]
+                if len(node.contributors) == 1
+            ]
+            if mass_contributors and all(
+                contributor.selectable_mass is not None
+                for contributor in mass_contributors
+            ):
+                if diagnostic_target_paths is None:
+                    raise ValueError(
+                        "selectable-mass candidate-pool tracing requires a "
+                        "canonical target path"
+                    )
+                target_path = [
+                    int(token_id) for token_id in diagnostic_target_paths[builder_index]
+                ]
+                correct_parent_ids = {0}
+                correct_node_ids: set[int] = set()
+                correct_parent_id = 0
+                for target_token_id in target_path:
+                    matching = [
+                        child_id
+                        for child_id in builder["children"][correct_parent_id]
+                        if generated_nodes[child_id].token_id == target_token_id
+                    ]
+                    if not matching:
+                        break
+                    correct_parent_id = matching[0]
+                    correct_parent_ids.add(correct_parent_id)
+                    correct_node_ids.add(correct_parent_id)
+                raw_parent_ids = {
+                    generated_nodes[node_id].parent_id for node_id in raw_selected_set
+                }
+                raw_leaf_ids = raw_selected_set - raw_parent_ids
+                raw_global_ranks = {
+                    node_id: rank
+                    for rank, node_id in enumerate(global_priority_order, start=1)
+                }
+                columns: dict[str, list[Any]] = {
+                    "full_node_id": [],
+                    "parent_full_node_id": [],
+                    "token_id": [],
+                    "depth": [],
+                    "head_id": [],
+                    "proposal_probability": [],
+                    "selectable_mass_estimate": [],
+                    "absolute_edge_probability_estimate": [],
+                    "raw_path_priority": [],
+                    "mass_adjusted_path_priority": [],
+                    "parent_raw_path_priority": [],
+                    "flags": [],
+                    "raw_global_rank": [],
+                }
+                continued_set = set(continued_full_ids)
+                for source in generated_nodes[1:]:
+                    if len(source.contributors) != 1:
+                        raise AssertionError(
+                            "selectable-mass candidate pool requires one head "
+                            "per generated node"
+                        )
+                    contributor = source.contributors[0]
+                    mass = contributor.selectable_mass
+                    if mass is None:
+                        raise AssertionError("selectable-mass prediction disappeared")
+                    parent_correct = source.parent_id in correct_parent_ids
+                    target_available = source.depth <= len(target_path)
+                    edge_correct = bool(
+                        parent_correct
+                        and target_available
+                        and source.token_id == target_path[source.depth - 1]
+                    )
+                    flags = (
+                        int(target_available)
+                        | (int(parent_correct) << 1)
+                        | (int(edge_correct) << 2)
+                        | (int(source.node_id in correct_node_ids) << 3)
+                        | (int(source.node_id in continued_set) << 4)
+                        | (int(source.node_id in raw_selected_set) << 5)
+                        | (int(source.node_id in raw_leaf_ids) << 6)
+                    )
+                    absolute_edge_probability = mass * contributor.proposal_prob
+                    parent_priority = generated_nodes[source.parent_id].priority
+                    columns["full_node_id"].append(source.node_id)
+                    columns["parent_full_node_id"].append(source.parent_id)
+                    columns["token_id"].append(source.token_id)
+                    columns["depth"].append(source.depth)
+                    columns["head_id"].append(contributor.head_id)
+                    columns["proposal_probability"].append(contributor.proposal_prob)
+                    columns["selectable_mass_estimate"].append(mass)
+                    columns["absolute_edge_probability_estimate"].append(
+                        absolute_edge_probability
+                    )
+                    columns["raw_path_priority"].append(source.priority)
+                    columns["mass_adjusted_path_priority"].append(
+                        parent_priority
+                        * contributor.lambda_weight
+                        * absolute_edge_probability
+                    )
+                    columns["parent_raw_path_priority"].append(parent_priority)
+                    columns["flags"].append(flags)
+                    columns["raw_global_rank"].append(raw_global_ranks[source.node_id])
+                dynamic_provenance["selectable_mass_candidate_pool"] = {
+                    "schema": "ordered_h10_selectable_mass_candidate_pool_v1",
+                    "row_count": len(generated_nodes) - 1,
+                    "tree_scoring_changed": False,
+                    "frontier_selection_changed": False,
+                    "flag_bits": {
+                        "target_available": 0,
+                        "parent_path_correct": 1,
+                        "edge_correct_given_parent": 2,
+                        "path_correct": 3,
+                        "continued_frontier": 4,
+                        "raw_final_tree": 5,
+                        "raw_final_leaf": 6,
+                    },
+                    "columns": columns,
+                }
             union_sources: dict[int, dict[str, int]] = builder["union_sources"]
             if union_sources:
 

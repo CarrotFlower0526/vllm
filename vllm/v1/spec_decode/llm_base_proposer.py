@@ -952,9 +952,7 @@ class SpecDecodeBaseProposer:
                         raise ValueError(
                             "tree-construction oracle is missing a request reference"
                         )
-                    root_offset = (
-                        len(canonical_replay.output_token_ids[req_index]) + 1
-                    )
+                    root_offset = len(canonical_replay.output_token_ids[req_index]) + 1
                     path = payload.path_token_ids
                     reference_path = config.token_ids[
                         root_offset : root_offset + len(path)
@@ -974,17 +972,16 @@ class SpecDecodeBaseProposer:
 
             def candidate_batch_fn(
                 states: Sequence[_ResidualTreeDraftState],
-            ) -> tuple[torch.Tensor, torch.Tensor]:
-                tokens, probabilities = self._residual_tree_greedy_candidates_batch(
+            ) -> Any:
+                output = self._residual_tree_greedy_candidates_batch(
                     residual_model,
                     states,
                 )
+                tokens, probabilities = output[:2]
                 target_ids = tree_oracle_targets(states)
                 if target_ids is None:
-                    return tokens, probabilities
-                target_mask = target_ids[:, None].ge(0) & tokens.eq(
-                    target_ids[:, None]
-                )
+                    return output
+                target_mask = target_ids[:, None].ge(0) & tokens.eq(target_ids[:, None])
                 below_one = torch.nextafter(
                     torch.ones(
                         (),
@@ -1002,7 +999,11 @@ class SpecDecodeBaseProposer:
                     torch.ones_like(probabilities),
                     probabilities.clamp_max(below_one),
                 )
-                return tokens, promoted
+                return (
+                    (tokens, promoted, output[2])
+                    if len(output) == 3
+                    else (tokens, promoted)
+                )
 
             root_candidates = candidate_batch_fn(root_states)
             diagnostic_target_paths = None
@@ -1028,9 +1029,7 @@ class SpecDecodeBaseProposer:
                             "canonical target-path diagnostics are missing a "
                             "request reference"
                         )
-                    root_offset = (
-                        len(canonical_replay.output_token_ids[req_index]) + 1
-                    )
+                    root_offset = len(canonical_replay.output_token_ids[req_index]) + 1
                     diagnostic_target_paths.append(
                         config.token_ids[root_offset : root_offset + int(max_depth)]
                     )
@@ -1047,6 +1046,9 @@ class SpecDecodeBaseProposer:
                     root_states=root_states,
                     root_candidate_tokens=root_candidates[0],
                     root_candidate_probabilities=root_candidates[1],
+                    root_candidate_selectable_masses=(
+                        root_candidates[2] if len(root_candidates) == 3 else None
+                    ),
                     candidate_batch_fn=candidate_batch_fn,
                     transition_batch_fn=lambda states, token_ids: (
                         self._residual_tree_transition_batch(
@@ -1075,9 +1077,7 @@ class SpecDecodeBaseProposer:
                             "canonical target-path provenance is unavailable"
                         )
                     tree.dynamic_provenance["canonical_target_path"].update(metadata)
-            draft_trees = [
-                tree_to_draft_token_tree(tree) for tree in selected_trees
-            ]
+            draft_trees = [tree_to_draft_token_tree(tree) for tree in selected_trees]
             if trace_path is not None:
                 for request_index, (tree, draft_tree) in enumerate(
                     zip(selected_trees, draft_trees, strict=True)
@@ -1941,6 +1941,15 @@ class SpecDecodeBaseProposer:
                                 "head_id": contributor.head_id,
                                 "proposal_row": contributor.proposal_row,
                                 "proposal_probability": (contributor.proposal_prob),
+                                "selectable_mass_estimate": (
+                                    contributor.selectable_mass
+                                ),
+                                "absolute_edge_probability_estimate": (
+                                    contributor.proposal_prob
+                                    * contributor.selectable_mass
+                                    if contributor.selectable_mass is not None
+                                    else None
+                                ),
                                 "lambda_weight": contributor.lambda_weight,
                                 "score": contributor.score,
                             }
@@ -2140,8 +2149,7 @@ class SpecDecodeBaseProposer:
             "parent_supported_half_cutoff_one_swap_v1",
         }:
             raise ValueError(
-                "unknown runtime final-boundary exchange mode: "
-                f"{boundary_exchange}"
+                f"unknown runtime final-boundary exchange mode: {boundary_exchange}"
             )
         if boundary_exchange != "none" and (
             node_budget != 60
@@ -2534,7 +2542,10 @@ class SpecDecodeBaseProposer:
         self,
         model: nn.Module,
         states: Sequence[_ResidualTreeDraftState],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         """Project compact ordered-head candidates for arbitrary tree states."""
 
         if not states:
@@ -2551,6 +2562,13 @@ class SpecDecodeBaseProposer:
                 "model does not expose compact residual greedy candidates"
             )
         hidden = torch.stack([state.proposal_hidden for state in states], dim=0)
+        has_selectable_mass = any(
+            getattr(model, name, None) is not None
+            for name in (
+                "residual_tree_selectable_mass_weight",
+                "_residual_tree_packed_logit_and_mass_in_weight",
+            )
+        )
         with (
             record_function_or_nullcontext("residual_tree: compact_candidates_batch"),
             torch.inference_mode(),
@@ -2559,16 +2577,18 @@ class SpecDecodeBaseProposer:
                 cast(Any, method),
                 hidden_states=hidden,
                 hidden=hidden,
+                return_selectable_mass=has_selectable_mass,
             )
         if (
             not isinstance(output, tuple)
-            or len(output) != 2
+            or len(output) not in (2, 3)
             or not all(isinstance(value, torch.Tensor) for value in output)
         ):
             raise TypeError(
-                "compact residual candidate hook must return token/prob tensors"
+                "compact residual candidate hook must return token/probability "
+                "tensors and optional selectable-mass predictions"
             )
-        tokens, probabilities = output
+        tokens, probabilities = output[:2]
         expected_num_heads = int(
             getattr(model, "residual_tree_total_heads", tokens.shape[-1])
         )
@@ -2577,6 +2597,18 @@ class SpecDecodeBaseProposer:
             raise ValueError(
                 f"compact residual candidates must have shape {expected_shape}"
             )
+        if len(output) == 3:
+            selectable_mass = output[2]
+            if (
+                selectable_mass.shape != expected_shape
+                or not bool(torch.isfinite(selectable_mass).all())
+                or bool(((selectable_mass <= 0) | (selectable_mass > 1)).any())
+            ):
+                raise ValueError(
+                    "selectable-mass predictions must match candidates and lie "
+                    "in (0, 1]"
+                )
+            return tokens, probabilities, selectable_mass
         return tokens, probabilities
 
     def _stock_top2_candidates_batch(

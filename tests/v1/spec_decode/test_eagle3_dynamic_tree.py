@@ -238,9 +238,7 @@ def test_parent_supported_boundary_exchange_swaps_only_one_leaf() -> None:
     raw_tree = select_batched_eagle3_dynamic_trees(**common)[0]
     exchanged_tree = select_batched_eagle3_dynamic_trees(
         **common,
-        final_boundary_exchange_mode=(
-            "parent_supported_half_cutoff_one_swap_v1"
-        ),
+        final_boundary_exchange_mode=("parent_supported_half_cutoff_one_swap_v1"),
     )[0]
 
     assert [node.token_id for node in raw_tree.nodes[1:]] == [1, 2, 3, 5]
@@ -279,13 +277,65 @@ def test_parent_supported_boundary_exchange_requires_stronger_parent() -> None:
         max_depth=2,
         frontier_width=2,
         collect_dynamic_provenance=True,
-        final_boundary_exchange_mode=(
-            "parent_supported_half_cutoff_one_swap_v1"
-        ),
+        final_boundary_exchange_mode=("parent_supported_half_cutoff_one_swap_v1"),
     )[0]
 
     assert tree.dynamic_provenance is not None
     assert tree.dynamic_provenance["final_boundary_exchange"]["exchanged"] is False
+
+
+def test_selectable_mass_is_traced_without_changing_raw_tree() -> None:
+    def candidates(states):
+        tokens, probabilities = _candidate_batch(states, width=2)
+        masses = torch.tensor([[1.0, 0.25]] * len(states), dtype=torch.float32)
+        return tokens, probabilities, masses
+
+    root = candidates([0])
+    common = {
+        "root_states": [0],
+        "root_candidate_tokens": root[0],
+        "root_candidate_probabilities": root[1],
+        "candidate_batch_fn": candidates,
+        "transition_batch_fn": lambda states, token_ids: list(token_ids),
+        "head_lambdas": (1.0, 1.0),
+        "node_budget": 10,
+        "max_depth": 3,
+        "frontier_width": 10,
+        "collect_dynamic_provenance": True,
+        "diagnostic_target_paths": [[1, 101, 10101]],
+    }
+    raw_tree = select_batched_eagle3_dynamic_trees(
+        **(common | {"candidate_batch_fn": lambda states: candidates(states)[:2]})
+    )[0]
+    mass_tree = select_batched_eagle3_dynamic_trees(
+        **common,
+        root_candidate_selectable_masses=root[2],
+    )[0]
+
+    assert [
+        (node.parent_id, node.token_id, node.priority) for node in mass_tree.nodes
+    ] == [(node.parent_id, node.token_id, node.priority) for node in raw_tree.nodes]
+    provenance = mass_tree.dynamic_provenance
+    assert provenance is not None
+    pool = provenance["selectable_mass_candidate_pool"]
+    assert pool["tree_scoring_changed"] is False
+    assert pool["frontier_selection_changed"] is False
+    columns = pool["columns"]
+    assert len(columns["full_node_id"]) == pool["row_count"]
+    assert columns["selectable_mass_estimate"][:2] == pytest.approx([1.0, 0.25])
+    assert columns["absolute_edge_probability_estimate"][:2] == pytest.approx(
+        [0.4, 0.05]
+    )
+    selected_pool_priorities = sorted(
+        priority
+        for priority, flags in zip(
+            columns["raw_path_priority"], columns["flags"], strict=True
+        )
+        if flags & (1 << 5)
+    )
+    assert selected_pool_priorities == pytest.approx(
+        sorted(node.priority for node in raw_tree.nodes[1:])
+    )
 
 
 def test_dynamic_union_provenance_tracks_final_node_sources() -> None:
@@ -356,9 +406,7 @@ def test_canonical_target_path_diagnostic_separates_pruning_stages() -> None:
         local_tree.dynamic_provenance["canonical_target_path"]["stop_stage"]
         == "absent_after_local_width10"
     )
-    local_probe = local_tree.dynamic_provenance[
-        "canonical_spine_candidate_states"
-    ]
+    local_probe = local_tree.dynamic_provenance["canonical_spine_candidate_states"]
     assert (
         local_tree.dynamic_provenance["canonical_spine_candidate_schema"]
         == "ordered_distinct_heads_same_process_v1"
@@ -368,8 +416,9 @@ def test_canonical_target_path_diagnostic_separates_pruning_stages() -> None:
     assert local_probe[0]["correct_token_available"] is False
     assert [row["token_id"] for row in local_probe[0]["candidates"]] == [1, 2]
     assert (
-        local_tree.dynamic_provenance["canonical_target_path"]
-        ["fixed_candidate_oracle_path_count"]
+        local_tree.dynamic_provenance["canonical_target_path"][
+            "fixed_candidate_oracle_path_count"
+        ]
         == 0
     )
 

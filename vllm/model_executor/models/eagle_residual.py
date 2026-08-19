@@ -13,13 +13,13 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
-from vllm.model_executor.kernels.residual_tree_union import (
-    fused_hybrid_union_top10,
-    supports_fused_hybrid_union,
-)
 from vllm.model_executor.kernels.residual_tree_ordered import (
     fused_ordered_distinct_top1,
     supports_fused_ordered_selection,
+)
+from vllm.model_executor.kernels.residual_tree_union import (
+    fused_hybrid_union_top10,
+    supports_fused_hybrid_union,
 )
 
 _RESIDUAL_TREE_GREEDY_EPS = 1e-12
@@ -96,8 +96,12 @@ class ResidualTreeHeadMixin:
     residual_tree_hybrid_union_clipped_mass_calibration: torch.Tensor | None
     residual_tree_state_candidate_calibration_weight: torch.Tensor | None
     residual_tree_state_candidate_calibration_bias: torch.Tensor | None
+    residual_tree_selectable_mass_weight: torch.Tensor | None
+    residual_tree_selectable_mass_bias: torch.Tensor | None
     _residual_tree_packed_independent_weight: torch.Tensor | None
     _residual_tree_packed_logit_in_weight: torch.Tensor | None
+    _residual_tree_packed_logit_and_mass_in_weight: torch.Tensor | None
+    _residual_tree_packed_logit_and_mass_in_bias: torch.Tensor | None
     _residual_tree_packed_logit_out_weight: torch.Tensor | None
     _residual_tree_shared_logit_out_weight: torch.Tensor | None
     _residual_tree_cached_draft_target_ids: torch.Tensor | None
@@ -131,12 +135,32 @@ class ResidualTreeHeadMixin:
             persistent=False,
         )
         self.register_buffer(
+            "residual_tree_selectable_mass_weight",
+            None,
+            persistent=False,
+        )
+        self.register_buffer(
+            "residual_tree_selectable_mass_bias",
+            None,
+            persistent=False,
+        )
+        self.register_buffer(
             "_residual_tree_packed_independent_weight",
             None,
             persistent=False,
         )
         self.register_buffer(
             "_residual_tree_packed_logit_in_weight",
+            None,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_residual_tree_packed_logit_and_mass_in_weight",
+            None,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_residual_tree_packed_logit_and_mass_in_bias",
             None,
             persistent=False,
         )
@@ -263,9 +287,7 @@ class ResidualTreeHeadMixin:
             draft_vocab_size <= 0
         ):
             raise ValueError(f"{output_mode} heads require draft_vocab_size")
-        vocab_projection = str(
-            config.get("adapter_vocab_projection", "per_head")
-        )
+        vocab_projection = str(config.get("adapter_vocab_projection", "per_head"))
         if vocab_projection not in {"per_head", "shared"}:
             raise ValueError(
                 "residual tree adapter_vocab_projection must be per_head or shared"
@@ -354,9 +376,7 @@ class ResidualTreeHeadMixin:
                 raise TypeError("residual tree adapter checkpoint must be a dict")
             shared_out = state.pop("shared_out.weight", None)
             if not isinstance(shared_out, torch.Tensor):
-                raise ValueError(
-                    "shared vocabulary checkpoint lacks shared_out.weight"
-                )
+                raise ValueError("shared vocabulary checkpoint lacks shared_out.weight")
             expected_shape = (draft_vocab_size, bottleneck)
             if tuple(shared_out.shape) != expected_shape:
                 raise ValueError(
@@ -365,6 +385,61 @@ class ResidualTreeHeadMixin:
                 )
             for adapter_index in range(adapter_count):
                 state[f"{adapter_index}.2.weight"] = shared_out
+
+        selectable_mass_config = config.get("residual_head_selectable_mass")
+        selectable_mass_weight = None
+        selectable_mass_bias = None
+        if selectable_mass_config is not None:
+            if not isinstance(selectable_mass_config, dict) or (
+                selectable_mass_config.get("schema")
+                != "qwen3_32b_residual_head_selectable_mass_v1"
+            ):
+                raise ValueError("unsupported residual-head selectable-mass output")
+            if not (
+                output_mode == "logit_residual"
+                and adapter_activation == "identity"
+                and vocab_projection == "shared"
+                and self.residual_tree_freeze_base_head
+                and self.residual_tree_total_heads == 10
+                and adapter_count == 9
+                and selectable_mass_config.get("heads") == list(range(2, 11))
+                and selectable_mass_config.get("target") == "selectable_residual_mass"
+                and selectable_mass_config.get("tree_scoring") == "diagnostic_only"
+            ):
+                raise ValueError(
+                    "selectable-mass outputs require the frozen-H1 shared "
+                    "low-rank ordered H2-H10 stack"
+                )
+            if not isinstance(state, dict):
+                raise TypeError("residual tree adapter checkpoint must be a dict")
+            selectable_mass_weight = state.pop("selectable_mass.weight", None)
+            selectable_mass_bias = state.pop("selectable_mass.bias", None)
+            expected_weight_shape = (adapter_count, hidden_size)
+            expected_bias_shape = (adapter_count,)
+            if (
+                not isinstance(selectable_mass_weight, torch.Tensor)
+                or tuple(selectable_mass_weight.shape) != expected_weight_shape
+            ):
+                raise ValueError(
+                    f"selectable_mass.weight must have shape {expected_weight_shape}"
+                )
+            if (
+                not isinstance(selectable_mass_bias, torch.Tensor)
+                or tuple(selectable_mass_bias.shape) != expected_bias_shape
+            ):
+                raise ValueError(
+                    f"selectable_mass.bias must have shape {expected_bias_shape}"
+                )
+            if (
+                selectable_mass_weight.dtype != dtype
+                or selectable_mass_bias.dtype != dtype
+                or not bool(torch.isfinite(selectable_mass_weight.float()).all())
+                or not bool(torch.isfinite(selectable_mass_bias.float()).all())
+            ):
+                raise ValueError(
+                    "selectable-mass parameters must be finite and match the "
+                    "draft execution dtype"
+                )
         depth_bias_mode = config.get("h2_tree_depth_bias_mode")
         depth_bias = None
         if depth_bias_mode is not None:
@@ -452,19 +527,33 @@ class ResidualTreeHeadMixin:
                 [adapter[0].weight.detach() for adapter in adapters], dim=0
             ).contiguous()
             rank = bottleneck
+            if selectable_mass_weight is not None:
+                assert selectable_mass_bias is not None
+                packed_logit_rows = adapter_count * rank
+                packed_in = torch.cat(
+                    (packed_in, selectable_mass_weight.to(dtype=dtype)),
+                    dim=0,
+                ).contiguous()
+                self._residual_tree_packed_logit_and_mass_in_weight = packed_in
+                self._residual_tree_packed_logit_and_mass_in_bias = (
+                    selectable_mass_bias.contiguous()
+                )
+                packed_logit_in = packed_in.narrow(0, 0, packed_logit_rows)
+            else:
+                packed_logit_in = packed_in
             for adapter_index, adapter in enumerate(adapters):
                 adapter[0].weight = nn.Parameter(
-                    packed_in.narrow(0, adapter_index * rank, rank),
+                    packed_logit_in.narrow(0, adapter_index * rank, rank),
                     requires_grad=adapter[0].weight.requires_grad,
                 )
-            self._residual_tree_packed_logit_in_weight = packed_in
+            self._residual_tree_packed_logit_in_weight = packed_logit_in
             if vocab_projection == "shared":
                 # Every adapter already references this one Parameter.  The
                 # non-persistent tensor view avoids another vocabulary-sized
                 # allocation while making the fused serving path explicit.
-                self._residual_tree_shared_logit_out_weight = (
-                    adapters[0][2].weight.detach()
-                )
+                self._residual_tree_shared_logit_out_weight = adapters[0][
+                    2
+                ].weight.detach()
             else:
                 packed_out = torch.stack(
                     [adapter[2].weight.detach() for adapter in adapters], dim=0
@@ -475,6 +564,14 @@ class ResidualTreeHeadMixin:
                         requires_grad=adapter[2].weight.requires_grad,
                     )
                 self._residual_tree_packed_logit_out_weight = packed_out
+        if selectable_mass_weight is not None and (
+            self._residual_tree_packed_logit_and_mass_in_weight is None
+        ):
+            # The reference/non-packed path remains available for diagnostics.
+            # Production shared-vocabulary serving uses the packed branch above,
+            # which appends these rows to the existing hidden-to-rank GEMM.
+            self.residual_tree_selectable_mass_weight = selectable_mass_weight
+            self.residual_tree_selectable_mass_bias = selectable_mass_bias
         self.residual_tree_adapters = adapters
         self.residual_tree_adapter_output_mode = output_mode
         self.residual_tree_draft_vocab_size = draft_vocab_size
@@ -498,9 +595,11 @@ class ResidualTreeHeadMixin:
                     "hybrid-union clipped-mass calibration requires "
                     "hybrid_union_top10_dynamic candidates"
                 )
-            if not isinstance(union_calibration, dict) or union_calibration.get(
-                "schema"
-            ) != "qwen3_hybrid_union_clipped_mass_calibration_v1":
+            if (
+                not isinstance(union_calibration, dict)
+                or union_calibration.get("schema")
+                != "qwen3_hybrid_union_clipped_mass_calibration_v1"
+            ):
                 raise ValueError("unsupported hybrid-union clipped-mass calibration")
             expected_metadata = {
                 "category_order": [
@@ -556,16 +655,17 @@ class ResidualTreeHeadMixin:
 
         state_calibration = config.get("state_candidate_mass_calibration")
         if state_calibration is not None:
-            if not isinstance(state_calibration, dict) or state_calibration.get(
-                "schema"
-            ) != "qwen3_32b_state_candidate_mass_calibrator_v1":
+            if (
+                not isinstance(state_calibration, dict)
+                or state_calibration.get("schema")
+                != "qwen3_32b_state_candidate_mass_calibrator_v1"
+            ):
                 raise ValueError("unsupported state candidate-mass calibration")
             if not (
                 self.residual_tree_freeze_base_head
                 and self.residual_tree_total_heads == 10
                 and output_mode == "logit_residual"
-                and state_calibration.get("calibrated_heads")
-                == list(range(2, 11))
+                and state_calibration.get("calibrated_heads") == list(range(2, 11))
                 and float(state_calibration.get("h1_factor", -1.0)) == 1.0
             ):
                 raise ValueError(
@@ -580,27 +680,29 @@ class ResidualTreeHeadMixin:
                 map_location="cpu",
                 weights_only=True,
             )
-            if not isinstance(calibration, dict) or calibration.get(
-                "schema"
-            ) != state_calibration["schema"]:
+            if (
+                not isinstance(calibration, dict)
+                or calibration.get("schema") != state_calibration["schema"]
+            ):
                 raise ValueError("state candidate-mass checkpoint has wrong schema")
             gate_weight = calibration.get("weight")
             gate_bias = calibration.get("bias")
             expected_weight_shape = (self.residual_tree_total_heads - 1, hidden_size)
             expected_bias_shape = (self.residual_tree_total_heads - 1,)
-            if not isinstance(gate_weight, torch.Tensor) or tuple(
-                gate_weight.shape
-            ) != expected_weight_shape:
+            if (
+                not isinstance(gate_weight, torch.Tensor)
+                or tuple(gate_weight.shape) != expected_weight_shape
+            ):
                 raise ValueError(
                     "state candidate-mass weight must have shape "
                     f"{expected_weight_shape}"
                 )
-            if not isinstance(gate_bias, torch.Tensor) or tuple(
-                gate_bias.shape
-            ) != expected_bias_shape:
+            if (
+                not isinstance(gate_bias, torch.Tensor)
+                or tuple(gate_bias.shape) != expected_bias_shape
+            ):
                 raise ValueError(
-                    "state candidate-mass bias must have shape "
-                    f"{expected_bias_shape}"
+                    f"state candidate-mass bias must have shape {expected_bias_shape}"
                 )
             if gate_weight.dtype != dtype or gate_bias.dtype != dtype:
                 raise ValueError(
@@ -612,12 +714,12 @@ class ResidualTreeHeadMixin:
             ):
                 raise ValueError("state candidate-mass checkpoint is non-finite")
             adapter_device = next(adapters.parameters()).device
-            self.residual_tree_state_candidate_calibration_weight = (
-                gate_weight.to(device=adapter_device).contiguous()
-            )
-            self.residual_tree_state_candidate_calibration_bias = (
-                gate_bias.to(device=adapter_device).contiguous()
-            )
+            self.residual_tree_state_candidate_calibration_weight = gate_weight.to(
+                device=adapter_device
+            ).contiguous()
+            self.residual_tree_state_candidate_calibration_bias = gate_bias.to(
+                device=adapter_device
+            ).contiguous()
 
         lambdas = getattr(spec_config, "residual_tree_head_lambdas", None)
         lambdas = lambdas or config.get("residual_tree_head_lambdas")
@@ -896,9 +998,7 @@ class ResidualTreeHeadMixin:
         if not self.has_residual_tree_heads():
             raise ValueError("residual tree heads are not configured")
 
-        packed_weight = getattr(
-            self, "_residual_tree_packed_independent_weight", None
-        )
+        packed_weight = getattr(self, "_residual_tree_packed_independent_weight", None)
         if packed_weight is not None:
             later_head_count = self.residual_tree_total_heads - 1
             later_draft_logits = torch.nn.functional.linear(
@@ -926,9 +1026,7 @@ class ResidualTreeHeadMixin:
         if self.residual_tree_freeze_base_head:
             logits.append(self.compute_logits(hidden_states))
             if self.residual_tree_adapter_output_mode == "logit_residual":
-                base_draft_logits = self.logits_processor(
-                    self.lm_head, hidden_states
-                )
+                base_draft_logits = self.logits_processor(self.lm_head, hidden_states)
                 if base_draft_logits is None:
                     raise ValueError("base draft logits are unavailable")
         for adapter in self.residual_tree_adapters:
@@ -1577,9 +1675,7 @@ class ResidualTreeHeadMixin:
             h1_scores = torch.exp(top_h1_logits.float() - h1_normalizer).clamp_min(
                 _RESIDUAL_TREE_GREEDY_EPS
             )
-            h2_scores = torch.exp(
-                top_h2_logits.float() - h2_normalizer
-            ).clamp_min(
+            h2_scores = torch.exp(top_h2_logits.float() - h2_normalizer).clamp_min(
                 _RESIDUAL_TREE_GREEDY_EPS
             )
 
@@ -1613,9 +1709,9 @@ class ResidualTreeHeadMixin:
                 calibrated_h2_scores.unsqueeze(2),
                 torch.zeros_like(calibrated_h2_scores).unsqueeze(2),
             ).amax(dim=1)
-            merged_h1_scores = (
-                h1_score_contributions + matching_h2_scores
-            ).clamp_max(1.0)
+            merged_h1_scores = (h1_score_contributions + matching_h2_scores).clamp_max(
+                1.0
+            )
             unique_h2_scores = torch.where(
                 h2_shared,
                 torch.zeros_like(calibrated_h2_scores),
@@ -1664,9 +1760,7 @@ class ResidualTreeHeadMixin:
                 union_scores,
                 torch.full_like(union_scores, -1.0),
             ).argmax(dim=1)
-            selected_target_tokens = union_target_tokens.gather(
-                1, selected_indices
-            )
+            selected_target_tokens = union_target_tokens.gather(1, selected_indices)
             already_selected = selected_target_tokens.eq(
                 oracle_target_tokens.unsqueeze(1)
             ) & oracle_target_tokens.unsqueeze(1).ge(0)
@@ -1681,9 +1775,7 @@ class ResidualTreeHeadMixin:
             selected_indices[available_rows, selected_slots[available_rows]] = (
                 oracle_indices[available_rows]
             )
-            selected_target_tokens = union_target_tokens.gather(
-                1, selected_indices
-            )
+            selected_target_tokens = union_target_tokens.gather(1, selected_indices)
             selected_scores = union_scores.gather(1, selected_indices)
             selected_scores[available_rows, selected_slots[available_rows]] = 1.0
         if not return_union_provenance:
@@ -1716,9 +1808,7 @@ class ResidualTreeHeadMixin:
             torch.full_like(h1_rank_for_h2, 3),
             torch.full_like(h1_rank_for_h2, 2),
         )
-        h1_score_heads = (
-            matching_h2_scores > h1_score_contributions
-        ).to(torch.long)
+        h1_score_heads = (matching_h2_scores > h1_score_contributions).to(torch.long)
         h2_score_heads = torch.ones_like(ranks)
         union_source_masks = torch.cat((h1_source_masks, h2_source_masks), dim=1)
         union_h1_ranks = torch.cat((ranks, h1_rank_for_h2), dim=1)
@@ -1804,17 +1894,14 @@ class ResidualTreeHeadMixin:
         expected_shape = (hidden_states.shape[0], self.residual_tree_total_heads)
         if probabilities.shape != expected_shape:
             raise ValueError(
-                "state-calibrated probabilities must have shape "
-                f"{expected_shape}"
+                f"state-calibrated probabilities must have shape {expected_shape}"
             )
         gate_logits = torch.nn.functional.linear(
             hidden_states.to(dtype=weight.dtype),
             weight,
             bias,
         )
-        gates = torch.sigmoid(gate_logits.float()).clamp_min(
-            _RESIDUAL_TREE_GREEDY_EPS
-        )
+        gates = torch.sigmoid(gate_logits.float()).clamp_min(_RESIDUAL_TREE_GREEDY_EPS)
         calibrated = probabilities.clone()
         calibrated[:, 1:] *= gates.to(dtype=calibrated.dtype)
         return calibrated
@@ -1822,7 +1909,12 @@ class ResidualTreeHeadMixin:
     def compute_residual_greedy_candidates(
         self,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        return_selectable_mass: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         """Select compact tokens and probabilities for any residual topology.
 
         The legacy checkpoint contract is two ordered heads: frozen stock H1
@@ -1831,11 +1923,13 @@ class ResidualTreeHeadMixin:
         Every later head masks all tokens selected by its predecessors before
         choosing one token.
 
-        Returns target-vocabulary token ids and their conditioned
-        probabilities, both with shape ``[batch, num_heads]`` in ordered-head
-        order. The compact probabilities preserve ``lambda*q`` node ordering
-        without retaining full proposal rows. Stochastic verification continues
-        to use :meth:`compute_residual_head_probs`.
+        Returns target-vocabulary token ids and their conditioned probabilities,
+        both with shape ``[batch, num_heads]`` in ordered-head order.  When
+        ``return_selectable_mass`` is true, a third tensor contains one for H1
+        and the H2-H10 predictions of selectable residual mass.  The raw
+        probabilities always preserve the existing ``lambda*q`` tree ordering;
+        selectable mass is diagnostic metadata and never changes the candidate
+        pool or the per-depth frontier.
         """
 
         ordered_head_stack = (
@@ -1843,15 +1937,11 @@ class ResidualTreeHeadMixin:
             and self.residual_tree_freeze_base_head
             and self.residual_tree_adapter_output_mode
             in {"independent_lm_head", "logit_residual"}
-            and len(self.residual_tree_adapters)
-            == self.residual_tree_total_heads - 1
+            and len(self.residual_tree_adapters) == self.residual_tree_total_heads - 1
             and hasattr(self, "logits_processor")
             and hasattr(self, "lm_head")
         )
-        if not (
-            self.supports_residual_greedy_candidates()
-            or ordered_head_stack
-        ):
+        if not (self.supports_residual_greedy_candidates() or ordered_head_stack):
             raise NotImplementedError(
                 "compact greedy selection requires a frozen base head followed "
                 "by one residual H2 or multiple independent ordered heads"
@@ -1865,15 +1955,34 @@ class ResidualTreeHeadMixin:
                 "compact greedy selection requires draft-vocabulary base logits"
             )
         if ordered_head_stack:
-            tokens, probabilities = self._compute_ordered_independent_greedy_candidates(
-                hidden_states,
-                first_logits=first_logits,
+            tokens, probabilities, selectable_mass = (
+                self._compute_ordered_independent_greedy_candidates(
+                    hidden_states,
+                    first_logits=first_logits,
+                )
             )
             probabilities = self._apply_state_candidate_mass_calibration(
                 hidden_states,
                 probabilities,
             )
+            if return_selectable_mass:
+                if selectable_mass is None:
+                    raise ValueError(
+                        "ordered residual checkpoint has no selectable-mass outputs"
+                    )
+                h1_mass = torch.ones(
+                    (hidden_states.shape[0], 1),
+                    dtype=selectable_mass.dtype,
+                    device=selectable_mass.device,
+                )
+                return (
+                    tokens,
+                    probabilities,
+                    torch.cat((h1_mass, selectable_mass), dim=1),
+                )
             return tokens, probabilities
+        if return_selectable_mass:
+            raise ValueError("selectable-mass outputs require the ordered H1-H10 stack")
         if self.residual_tree_adapter_output_mode == "logit_residual":
             second_logits = first_logits + self.residual_tree_adapters[0](hidden_states)
         else:
@@ -1996,12 +2105,44 @@ class ResidualTreeHeadMixin:
         probabilities = torch.stack((first_probabilities, second_probabilities), dim=1)
         return tokens, probabilities
 
+    def _compute_selectable_mass_reference(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Reference projection used only when packed ordered heads are disabled."""
+
+        weight = getattr(self, "residual_tree_selectable_mass_weight", None)
+        bias = getattr(self, "residual_tree_selectable_mass_bias", None)
+        if weight is None and bias is None:
+            packed_weight = getattr(
+                self, "_residual_tree_packed_logit_and_mass_in_weight", None
+            )
+            packed_bias = getattr(
+                self, "_residual_tree_packed_logit_and_mass_in_bias", None
+            )
+            if packed_weight is None and packed_bias is None:
+                return None
+            if packed_weight is None or packed_bias is None:
+                raise AssertionError("packed selectable-mass output is incomplete")
+            later_head_count = self.residual_tree_total_heads - 1
+            weight = packed_weight[-later_head_count:]
+            bias = packed_bias[-later_head_count:]
+        if weight is None or bias is None:
+            raise AssertionError("selectable-mass output is incomplete")
+        logits = torch.nn.functional.linear(
+            hidden_states.to(dtype=weight.dtype), weight, bias
+        )
+        return torch.sigmoid(logits.float()).clamp(
+            min=_RESIDUAL_TREE_GREEDY_EPS,
+            max=1.0,
+        )
+
     def _compute_ordered_independent_greedy_candidates(
         self,
         hidden_states: torch.Tensor,
         *,
         first_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Select one conditioned token from every independent ordered head."""
 
         draft_vocab_size = self.residual_tree_draft_vocab_size
@@ -2040,9 +2181,7 @@ class ResidualTreeHeadMixin:
             invalid_mapping = (
                 (target_ids < 0) | (target_ids >= target_vocab_size)
             ).any()
-            duplicate_mapping = (
-                sorted_target_ids[1:] == sorted_target_ids[:-1]
-            ).any()
+            duplicate_mapping = (sorted_target_ids[1:] == sorted_target_ids[:-1]).any()
             invalid, duplicate = (
                 torch.stack((invalid_mapping, duplicate_mapping)).cpu().tolist()
             )
@@ -2069,8 +2208,7 @@ class ResidualTreeHeadMixin:
                 )
             else:
                 head_logits.extend(
-                    adapter(hidden_states)
-                    for adapter in self.residual_tree_adapters
+                    adapter(hidden_states) for adapter in self.residual_tree_adapters
                 )
             for head_index, logits in enumerate(head_logits):
                 if logits.shape != first_logits.shape:
@@ -2084,33 +2222,29 @@ class ResidualTreeHeadMixin:
                 log_probabilities = torch.log_softmax(conditioned_logits, dim=1)
                 draft_token = torch.argmax(log_probabilities, dim=1)
                 selected_draft_tokens.append(draft_token)
-                selected_target_tokens.append(
-                    target_ids.index_select(0, draft_token)
-                )
+                selected_target_tokens.append(target_ids.index_select(0, draft_token))
                 selected_probabilities.append(
                     torch.exp(
-                        log_probabilities.gather(
-                            1, draft_token.unsqueeze(1)
-                        ).squeeze(1)
+                        log_probabilities.gather(1, draft_token.unsqueeze(1)).squeeze(1)
                     )
                 )
             return (
                 torch.stack(selected_target_tokens, dim=1),
                 torch.stack(selected_probabilities, dim=1),
+                self._compute_selectable_mass_reference(hidden_states),
             )
 
-        packed_weight = getattr(
-            self, "_residual_tree_packed_independent_weight", None
+        packed_weight = getattr(self, "_residual_tree_packed_independent_weight", None)
+        packed_logit_in = getattr(self, "_residual_tree_packed_logit_in_weight", None)
+        packed_logit_out = getattr(self, "_residual_tree_packed_logit_out_weight", None)
+        shared_logit_out = getattr(self, "_residual_tree_shared_logit_out_weight", None)
+        packed_logit_and_mass_in = getattr(
+            self, "_residual_tree_packed_logit_and_mass_in_weight", None
         )
-        packed_logit_in = getattr(
-            self, "_residual_tree_packed_logit_in_weight", None
+        packed_logit_and_mass_bias = getattr(
+            self, "_residual_tree_packed_logit_and_mass_in_bias", None
         )
-        packed_logit_out = getattr(
-            self, "_residual_tree_packed_logit_out_weight", None
-        )
-        shared_logit_out = getattr(
-            self, "_residual_tree_shared_logit_out_weight", None
-        )
+        selectable_mass = None
         if packed_weight is not None:
             later_logits = torch.nn.functional.linear(
                 hidden_states, packed_weight
@@ -2122,9 +2256,25 @@ class ResidualTreeHeadMixin:
         elif packed_logit_in is not None and shared_logit_out is not None:
             later_head_count = self.residual_tree_total_heads - 1
             rank = shared_logit_out.shape[1]
-            low_rank_hidden = torch.nn.functional.linear(
-                hidden_states, packed_logit_in
-            ).view(hidden_states.shape[0], later_head_count, rank)
+            if packed_logit_and_mass_in is not None:
+                if packed_logit_and_mass_bias is None:
+                    raise AssertionError("packed selectable-mass bias is missing")
+                packed_hidden = torch.nn.functional.linear(
+                    hidden_states,
+                    packed_logit_and_mass_in,
+                )
+                logit_rows = later_head_count * rank
+                low_rank_hidden = packed_hidden[:, :logit_rows].view(
+                    hidden_states.shape[0], later_head_count, rank
+                )
+                selectable_mass = torch.sigmoid(
+                    packed_hidden[:, logit_rows:].float()
+                    + packed_logit_and_mass_bias.float()
+                ).clamp(min=_RESIDUAL_TREE_GREEDY_EPS, max=1.0)
+            else:
+                low_rank_hidden = torch.nn.functional.linear(
+                    hidden_states, packed_logit_in
+                ).view(hidden_states.shape[0], later_head_count, rank)
             later_logits = torch.nn.functional.linear(
                 low_rank_hidden.reshape(-1, rank), shared_logit_out
             ).view(
@@ -2136,9 +2286,25 @@ class ResidualTreeHeadMixin:
         elif packed_logit_in is not None and packed_logit_out is not None:
             later_head_count = self.residual_tree_total_heads - 1
             rank = packed_logit_out.shape[2]
-            low_rank_hidden = torch.nn.functional.linear(
-                hidden_states, packed_logit_in
-            ).view(hidden_states.shape[0], later_head_count, rank)
+            if packed_logit_and_mass_in is not None:
+                if packed_logit_and_mass_bias is None:
+                    raise AssertionError("packed selectable-mass bias is missing")
+                packed_hidden = torch.nn.functional.linear(
+                    hidden_states,
+                    packed_logit_and_mass_in,
+                )
+                logit_rows = later_head_count * rank
+                low_rank_hidden = packed_hidden[:, :logit_rows].view(
+                    hidden_states.shape[0], later_head_count, rank
+                )
+                selectable_mass = torch.sigmoid(
+                    packed_hidden[:, logit_rows:].float()
+                    + packed_logit_and_mass_bias.float()
+                ).clamp(min=_RESIDUAL_TREE_GREEDY_EPS, max=1.0)
+            else:
+                low_rank_hidden = torch.nn.functional.linear(
+                    hidden_states, packed_logit_in
+                ).view(hidden_states.shape[0], later_head_count, rank)
             later_logits = torch.bmm(
                 low_rank_hidden.transpose(0, 1),
                 packed_logit_out.transpose(1, 2),
@@ -2151,6 +2317,7 @@ class ResidualTreeHeadMixin:
             )
             if self.residual_tree_adapter_output_mode == "logit_residual":
                 later_logits = later_logits + first_logits.unsqueeze(1)
+            selectable_mass = self._compute_selectable_mass_reference(hidden_states)
         if later_logits.shape != (
             first_logits.shape[0],
             self.residual_tree_total_heads - 1,
@@ -2167,7 +2334,7 @@ class ResidualTreeHeadMixin:
             selected_target_tokens = target_ids.index_select(
                 0, selected_draft_token_tensor.reshape(-1)
             ).reshape(selected_draft_token_tensor.shape)
-            return selected_target_tokens, selected_probabilities
+            return selected_target_tokens, selected_probabilities, selectable_mass
 
         # The reference path normalized each head separately before argmax.
         # Log-softmax preserves the logit ordering, so select the same ordered
@@ -2179,20 +2346,14 @@ class ResidualTreeHeadMixin:
         ).float()
         selected_draft_tokens: list[torch.Tensor] = []
         for head_index in range(self.residual_tree_total_heads):
-            draft_token = torch.argmax(
-                conditioned_logits[:, head_index], dim=1
-            )
+            draft_token = torch.argmax(conditioned_logits[:, head_index], dim=1)
             selected_draft_tokens.append(draft_token)
             if head_index + 1 < self.residual_tree_total_heads:
                 later_rows = conditioned_logits[:, head_index + 1 :]
-                blocked = draft_token[:, None, None].expand(
-                    -1, later_rows.shape[1], 1
-                )
+                blocked = draft_token[:, None, None].expand(-1, later_rows.shape[1], 1)
                 later_rows.scatter_(2, blocked, float("-inf"))
 
-        selected_draft_token_tensor = torch.stack(
-            selected_draft_tokens, dim=1
-        )
+        selected_draft_token_tensor = torch.stack(selected_draft_tokens, dim=1)
         log_probabilities = torch.log_softmax(conditioned_logits, dim=2)
         selected_probabilities = torch.exp(
             log_probabilities.gather(
@@ -2202,7 +2363,7 @@ class ResidualTreeHeadMixin:
         selected_target_tokens = target_ids.index_select(
             0, selected_draft_token_tensor.reshape(-1)
         ).reshape(selected_draft_token_tensor.shape)
-        return selected_target_tokens, selected_probabilities
+        return selected_target_tokens, selected_probabilities, selectable_mass
 
     def supports_residual_b2d1_greedy_candidates(self) -> bool:
         """Backward-compatible alias for older proposer integrations."""
