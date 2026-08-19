@@ -144,3 +144,7 @@ vulnerability process.
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
+- **Changes used by stack-spec Fleet experiments**:
+  [`docs/contributing/stack_spec_fleet_worker.md`](docs/contributing/stack_spec_fleet_worker.md)
+  — Portability, isolation, frozen-path, runtime-impact, and publish gates for
+  this custom vLLM fork.
