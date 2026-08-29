@@ -2324,26 +2324,45 @@ def select_batched_eagle3_dynamic_trees(
                 *,
                 generated_nodes: Sequence[ResidualTreeNode] = generated_nodes,
             ) -> list[dict[str, Any]]:
-                counts: dict[int, dict[int, int]] = {}
+                counts: dict[int, dict[str, Any]] = {}
                 for full_node_id in full_node_ids:
                     source = generated_nodes[full_node_id]
-                    if len(source.contributors) != 1:
+                    if not source.contributors:
                         raise AssertionError(
-                            "dynamic candidates must have exactly one contributor"
+                            "dynamic candidate contributor identity is unavailable"
                         )
-                    head_id = int(source.contributors[0].head_id)
-                    depth_counts = counts.setdefault(int(source.depth), {})
-                    depth_counts[head_id] = depth_counts.get(head_id, 0) + 1
+                    depth_counts = counts.setdefault(
+                        int(source.depth),
+                        {
+                            "total": 0,
+                            "contributor_total": 0,
+                            "merged_node_count": 0,
+                            "head_counts": {},
+                        },
+                    )
+                    depth_counts["total"] += 1
+                    depth_counts["contributor_total"] += len(source.contributors)
+                    depth_counts["merged_node_count"] += int(
+                        len(source.contributors) > 1
+                    )
+                    head_counts = depth_counts["head_counts"]
+                    for contributor in source.contributors:
+                        head_id = int(contributor.head_id)
+                        head_counts[head_id] = head_counts.get(head_id, 0) + 1
                 return [
                     {
                         "depth": depth,
-                        "total": sum(head_counts.values()),
+                        "total": values["total"],
+                        "contributor_total": values["contributor_total"],
+                        "merged_node_count": values["merged_node_count"],
                         "head_counts": [
                             {"head_id": head_id, "count": count}
-                            for head_id, count in sorted(head_counts.items())
+                            for head_id, count in sorted(
+                                values["head_counts"].items()
+                            )
                         ],
                     }
-                    for depth, head_counts in sorted(counts.items())
+                    for depth, values in sorted(counts.items())
                 ]
 
             continued_full_ids = [

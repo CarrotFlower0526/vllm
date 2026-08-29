@@ -123,12 +123,34 @@ def test_dynamic_global_pruning_admits_a_high_score_child_with_its_ancestor() ->
         node_budget=2,
         max_depth=2,
         frontier_width=2,
+        collect_dynamic_provenance=True,
         candidate_selection="head_top1",
     )[0]
 
     assert [node.token_id for node in tree.nodes[1:]] == [1, 9]
     assert tree.nodes[2].priority == pytest.approx(0.4)
     assert [item.head_id for item in tree.nodes[2].contributors] == [0, 1]
+    assert tree.dynamic_provenance is not None
+    assert tree.dynamic_provenance["generated_by_depth"][1] == {
+        "depth": 2,
+        "total": 2,
+        "contributor_total": 4,
+        "merged_node_count": 2,
+        "head_counts": [
+            {"head_id": 0, "count": 2},
+            {"head_id": 1, "count": 2},
+        ],
+    }
+    assert tree.dynamic_provenance["final_tree_by_depth"][1] == {
+        "depth": 2,
+        "total": 1,
+        "contributor_total": 2,
+        "merged_node_count": 1,
+        "head_counts": [
+            {"head_id": 0, "count": 1},
+            {"head_id": 1, "count": 1},
+        ],
+    }
     _assert_ancestor_closed(tree)
 
 
@@ -183,6 +205,8 @@ def test_dynamic_provenance_records_generated_frontier_and_final_counts() -> Non
             {
                 "depth": 1,
                 "total": 2,
+                "contributor_total": 2,
+                "merged_node_count": 0,
                 "head_counts": [
                     {"head_id": 0, "count": 1},
                     {"head_id": 1, "count": 1},
@@ -191,6 +215,8 @@ def test_dynamic_provenance_records_generated_frontier_and_final_counts() -> Non
             {
                 "depth": 2,
                 "total": 4,
+                "contributor_total": 4,
+                "merged_node_count": 0,
                 "head_counts": [
                     {"head_id": 0, "count": 2},
                     {"head_id": 1, "count": 2},
@@ -199,6 +225,8 @@ def test_dynamic_provenance_records_generated_frontier_and_final_counts() -> Non
             {
                 "depth": 3,
                 "total": 8,
+                "contributor_total": 8,
+                "merged_node_count": 0,
                 "head_counts": [
                     {"head_id": 0, "count": 4},
                     {"head_id": 1, "count": 4},
@@ -209,6 +237,8 @@ def test_dynamic_provenance_records_generated_frontier_and_final_counts() -> Non
             {
                 "depth": 1,
                 "total": 2,
+                "contributor_total": 2,
+                "merged_node_count": 0,
                 "head_counts": [
                     {"head_id": 0, "count": 1},
                     {"head_id": 1, "count": 1},
@@ -217,6 +247,8 @@ def test_dynamic_provenance_records_generated_frontier_and_final_counts() -> Non
             {
                 "depth": 2,
                 "total": 4,
+                "contributor_total": 4,
+                "merged_node_count": 0,
                 "head_counts": [
                     {"head_id": 0, "count": 2},
                     {"head_id": 1, "count": 2},
@@ -227,6 +259,8 @@ def test_dynamic_provenance_records_generated_frontier_and_final_counts() -> Non
             {
                 "depth": 1,
                 "total": 2,
+                "contributor_total": 2,
+                "merged_node_count": 0,
                 "head_counts": [
                     {"head_id": 0, "count": 1},
                     {"head_id": 1, "count": 1},
@@ -235,6 +269,8 @@ def test_dynamic_provenance_records_generated_frontier_and_final_counts() -> Non
             {
                 "depth": 2,
                 "total": 4,
+                "contributor_total": 4,
+                "merged_node_count": 0,
                 "head_counts": [
                     {"head_id": 0, "count": 2},
                     {"head_id": 1, "count": 2},
@@ -243,6 +279,8 @@ def test_dynamic_provenance_records_generated_frontier_and_final_counts() -> Non
             {
                 "depth": 3,
                 "total": 4,
+                "contributor_total": 4,
+                "merged_node_count": 0,
                 "head_counts": [
                     {"head_id": 0, "count": 3},
                     {"head_id": 1, "count": 1},
