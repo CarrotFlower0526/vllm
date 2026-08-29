@@ -1495,8 +1495,9 @@ def select_batched_eagle3_dynamic_trees(
     The root proposal is depth one.  At each following depth, at most
     ``frontier_width`` candidates from the preceding depth are transitioned
     and expanded together.  After reaching ``max_depth``, the globally best
-    ``node_budget`` generated candidates are retained.  Candidate scores are
-    cumulative path probabilities, so the final selection is ancestor-closed.
+    ``node_budget`` generated candidates are retained.  Merged candidate
+    scores can exceed their parent score, so final selection admits each
+    candidate together with its missing ancestor chain.
 
     Stock supplies H1 top-10 candidates.  Residual J supplies its ordered H1
     and H2 candidates.  Both therefore share exactly the same expansion and
@@ -2101,25 +2102,35 @@ def select_batched_eagle3_dynamic_trees(
             key=lambda node_id: (-generated_nodes[node_id].priority, node_id),
         )
         effective_node_budget = min(node_budget, len(global_priority_order))
-        if preserve_spine_count:
-            forced_ids = {
-                node_id for spine in builder["preserved_spines"] for node_id in spine
+        forced_ids = (
+            {
+                node_id
+                for spine in builder["preserved_spines"]
+                for node_id in spine
             }
-            selected_set = set(forced_ids)
+            if preserve_spine_count
+            else set()
+        )
+        selected_set = set(forced_ids)
+        while len(selected_set) < effective_node_budget:
+            previous_count = len(selected_set)
             for full_id in global_priority_order:
                 if len(selected_set) >= effective_node_budget:
                     break
                 if full_id in selected_set:
                     continue
-                parent_id = generated_nodes[full_id].parent_id
-                if parent_id == 0 or parent_id in selected_set:
-                    selected_set.add(full_id)
-            if len(selected_set) != effective_node_budget:
-                raise RuntimeError("preserved-spine pruning could not fill the budget")
-            selected_full_ids = sorted(selected_set)
-        else:
-            selected_full_ids = sorted(global_priority_order[:effective_node_budget])
-        selected_set = set(selected_full_ids)
+                missing_chain = []
+                ancestor_id = full_id
+                while ancestor_id != 0 and ancestor_id not in selected_set:
+                    missing_chain.append(ancestor_id)
+                    ancestor_id = generated_nodes[ancestor_id].parent_id
+                if len(selected_set) + len(missing_chain) <= effective_node_budget:
+                    selected_set.update(missing_chain)
+            if len(selected_set) == previous_count:
+                break
+        if len(selected_set) != effective_node_budget:
+            raise RuntimeError("ancestor-closed pruning could not fill the node budget")
+        selected_full_ids = sorted(selected_set)
         for full_id in selected_full_ids:
             parent_id = generated_nodes[full_id].parent_id
             if parent_id != 0 and parent_id not in selected_set:

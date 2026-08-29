@@ -104,6 +104,34 @@ def test_dynamic_head_top1_merges_duplicate_tokens_before_pruning() -> None:
     assert tree.children[0] == [1, 2]
 
 
+def test_dynamic_global_pruning_admits_a_high_score_child_with_its_ancestor() -> None:
+    def duplicate_children(states):
+        return (
+            torch.tensor(
+                [[9, 9] if int(state) == 1 else [10, 10] for state in states]
+            ),
+            torch.ones((len(states), 2)),
+        )
+
+    tree = select_batched_eagle3_dynamic_trees(
+        root_states=[0],
+        root_candidate_tokens=torch.tensor([[1, 2]]),
+        root_candidate_probabilities=torch.tensor([[0.2, 0.19]]),
+        candidate_batch_fn=duplicate_children,
+        transition_batch_fn=lambda states, token_ids: list(token_ids),
+        head_lambdas=(1.0, 1.0),
+        node_budget=2,
+        max_depth=2,
+        frontier_width=2,
+        candidate_selection="head_top1",
+    )[0]
+
+    assert [node.token_id for node in tree.nodes[1:]] == [1, 9]
+    assert tree.nodes[2].priority == pytest.approx(0.4)
+    assert [item.head_id for item in tree.nodes[2].contributors] == [0, 1]
+    _assert_ancestor_closed(tree)
+
+
 def test_dynamic_depth_head_lambdas_change_only_existing_priority_weight() -> None:
     root_tokens = torch.tensor([[1, 2]], dtype=torch.long)
     root_probabilities = torch.tensor([[0.9, 0.8]], dtype=torch.float32)
