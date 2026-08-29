@@ -195,6 +195,8 @@ class SpeculativeConfig:
         "hybrid_union_top10_dynamic",
     ] = "head_top1"
     """How each ordered residual head selects its one child at a tree state.
+    ``head_top1`` preserves every head's independent native distribution;
+    repeated token winners are merged into one physical child before pruning.
     ``distinct_head_top1`` zeros tokens already selected by earlier heads,
     renormalizes the remaining proposal, and uses that same conditional
     proposal for selection, scoring, and verification.
@@ -1336,6 +1338,7 @@ class SpeculativeConfig:
                         "budget between 1 and 60"
                     )
                 if self.residual_tree_candidate_selection not in {
+                    "head_top1",
                     "distinct_head_top1",
                     "hybrid_top9_h2_dynamic",
                     "hybrid_top8_h2_top2_dynamic",
@@ -1346,7 +1349,8 @@ class SpeculativeConfig:
                 }:
                     raise ValueError(
                         "eagle3_dynamic residual trees require "
-                        "distinct_head_top1 or a supported hybrid candidate layout"
+                        "head_top1, distinct_head_top1, or a supported hybrid "
+                        "candidate layout"
                     )
                 if self.residual_tree_scorer_mode != "lambda_q":
                     raise ValueError(

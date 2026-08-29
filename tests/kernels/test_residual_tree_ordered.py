@@ -6,6 +6,7 @@ import torch
 
 from vllm.model_executor.kernels.residual_tree_ordered import (
     fused_ordered_distinct_top1,
+    fused_ordered_head_top1,
     supports_fused_ordered_selection,
 )
 
@@ -104,6 +105,31 @@ def test_fused_ordered_selection_uses_leftmost_tie_and_prior_masks() -> None:
     assert torch.equal(actual_tokens, expected_tokens)
     torch.testing.assert_close(
         actual_probabilities,
+        expected_probabilities,
+        rtol=2e-6,
+        atol=2e-9,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_independent_head_top1_preserves_repeated_winners() -> None:
+    vocab_size = 32000
+    first = torch.zeros((1, vocab_size), dtype=torch.bfloat16, device="cuda")
+    later = torch.zeros((1, 9, vocab_size), dtype=torch.bfloat16, device="cuda")
+    first[0, 17] = 8
+    later[:, :, 17] = 8
+
+    tokens, probabilities = fused_ordered_head_top1(first, later)
+    all_logits = torch.cat((first.unsqueeze(1), later), dim=1).float()
+    expected_tokens = all_logits.argmax(dim=2)
+    expected_probabilities = torch.softmax(all_logits, dim=2).gather(
+        2, expected_tokens.unsqueeze(2)
+    ).squeeze(2)
+
+    assert tokens.tolist() == [[17] * 10]
+    assert torch.equal(tokens, expected_tokens)
+    torch.testing.assert_close(
+        probabilities,
         expected_probabilities,
         rtol=2e-6,
         atol=2e-9,

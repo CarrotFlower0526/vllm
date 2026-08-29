@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from vllm.v1.spec_decode.residual_tree import (
@@ -81,6 +82,26 @@ def test_residual_dynamic_uses_same_beam_pruner_with_two_heads() -> None:
     assert max(node.depth for node in trees[0].nodes) == 3
     assert {node.contributors[0].head_id for node in trees[0].nodes[1:]} == {0, 1}
     _assert_ancestor_closed(trees[0])
+
+
+def test_dynamic_head_top1_merges_duplicate_tokens_before_pruning() -> None:
+    tree = select_batched_eagle3_dynamic_trees(
+        root_states=[0],
+        root_candidate_tokens=torch.tensor([[7, 7, 8]]),
+        root_candidate_probabilities=torch.tensor([[0.4, 0.3, 0.2]]),
+        candidate_batch_fn=lambda states: _candidate_batch(states, width=3),
+        transition_batch_fn=lambda states, token_ids: list(token_ids),
+        head_lambdas=(0.5, 0.25, 1.0),
+        node_budget=2,
+        max_depth=1,
+        candidate_selection="head_top1",
+    )[0]
+
+    assert [node.token_id for node in tree.nodes[1:]] == [7, 8]
+    merged = tree.nodes[1]
+    assert [item.head_id for item in merged.contributors] == [0, 1]
+    assert merged.priority == pytest.approx(0.4 * 0.5 + 0.3 * 0.25)
+    assert tree.children[0] == [1, 2]
 
 
 def test_dynamic_depth_head_lambdas_change_only_existing_priority_weight() -> None:

@@ -219,6 +219,28 @@ def test_ordered_independent_heads_each_select_one_new_conditioned_token() -> No
     assert len(set(tokens.tolist()[0])) == 4
 
 
+def test_raw_ordered_heads_keep_independent_top1_and_native_probability() -> None:
+    model = _OrderedFourHeadResidualModel()
+    model.residual_tree_required_candidate_selection = "head_top1"
+    hidden_states = torch.zeros((1, 4))
+
+    tokens, probabilities = model.compute_residual_greedy_candidates(hidden_states)
+
+    logits_by_head = torch.stack(
+        [
+            model._base_draft_logits[0],
+            *(adapter.logits[0] for adapter in model.residual_tree_adapters),
+        ]
+    )
+    expected_tokens = logits_by_head.argmax(dim=1)
+    expected_probabilities = torch.softmax(logits_by_head.float(), dim=1).gather(
+        1, expected_tokens.unsqueeze(1)
+    ).squeeze(1)
+    assert tokens.tolist() == [[1, 1, 1, 1]]
+    assert torch.equal(tokens[0], expected_tokens)
+    assert torch.equal(probabilities[0], expected_probabilities)
+
+
 def test_state_candidate_mass_calibration_scales_only_later_heads() -> None:
     model = _OrderedFourHeadResidualModel()
     model.residual_tree_state_candidate_calibration_weight = torch.zeros((3, 4))

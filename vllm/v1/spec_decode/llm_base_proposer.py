@@ -919,9 +919,13 @@ class SpecDecodeBaseProposer:
                     "EAGLE-3 dynamic serving does not support training-feature "
                     "or probability traces"
                 )
-            if configured_candidate_selection != "distinct_head_top1":
+            if configured_candidate_selection not in {
+                "head_top1",
+                "distinct_head_top1",
+            }:
                 raise ValueError(
-                    "residual EAGLE-3 dynamic trees require distinct ordered heads"
+                    "residual EAGLE-3 dynamic trees require head_top1 or "
+                    "distinct_head_top1"
                 )
             canonical_replay = sampling_metadata.canonical_token_replay
             tree_oracle_enabled = (
@@ -1050,6 +1054,7 @@ class SpecDecodeBaseProposer:
                     frontier_width=10,
                     collect_dynamic_provenance=trace_path is not None,
                     diagnostic_target_paths=diagnostic_target_paths,
+                    candidate_selection=configured_candidate_selection,
                 )
             if diagnostic_target_metadata is not None:
                 for tree, metadata in zip(
@@ -1131,7 +1136,8 @@ class SpecDecodeBaseProposer:
         can_use_batched_greedy_trees = (
             bool(sampling_metadata.all_greedy)
             and node_budget > 0
-            and configured_candidate_selection == "distinct_head_top1"
+            and configured_candidate_selection
+            in {"head_top1", "distinct_head_top1"}
             and scorer_mode == "lambda_q"
             and trace_path is None
             and batch_drafting

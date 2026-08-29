@@ -246,6 +246,62 @@ def test_residual_tree_loads_identity_low_rank_logit_residual(tmp_path):
     assert torch.equal(logits[:, 1], base + expected_delta)
 
 
+def test_raw_head_distribution_requires_independent_head_top1(tmp_path):
+    config_path = tmp_path / "shared_stack_config.json"
+    checkpoint_path = tmp_path / "residual_adapters.pt"
+    config_path.write_text(
+        """{
+  "method": "vllm_eagle3_shared_trunk_residual_heads",
+  "hidden_size": 2,
+  "adapter_bottleneck": 1,
+  "adapter_depth": 2,
+  "adapter_output_mode": "logit_residual",
+  "adapter_activation": "identity",
+  "draft_vocab_size": 3,
+  "num_residual_adapters": 1,
+  "num_layers": 2,
+  "freeze_base_head": true,
+  "serving_proposal_mode": "raw_head_distribution",
+  "recommended_candidate_selection": "head_top1"
+}""",
+        encoding="utf-8",
+    )
+    torch.save(
+        {
+            "0.0.weight": torch.ones((1, 2)),
+            "0.2.weight": torch.ones((3, 1)),
+        },
+        checkpoint_path,
+    )
+
+    class DummyResidualModel(ResidualTreeHeadMixin, nn.Module):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = SimpleNamespace(
+                hidden_size=2,
+                draft_vocab_size=3,
+                vocab_size=3,
+            )
+            self.lm_head = nn.Linear(2, 3, bias=False)
+            self.logits_processor = lambda head, hidden: head(hidden)
+
+    model = DummyResidualModel()
+    model._init_residual_tree_heads(
+        SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                residual_tree_adapter_config=str(config_path),
+                residual_tree_adapter_checkpoint=str(checkpoint_path),
+                residual_tree_candidate_selection="head_top1",
+                draft_model_config=SimpleNamespace(dtype=torch.float32),
+                residual_tree_head_lambdas=[1.0, 1.0],
+            ),
+            model_config=SimpleNamespace(dtype=torch.float32),
+        )
+    )
+
+    assert model.residual_tree_required_candidate_selection == "head_top1"
+
+
 def test_residual_tree_loads_one_shared_vocabulary_projection(tmp_path):
     config_path = tmp_path / "shared_stack_config.json"
     checkpoint_path = tmp_path / "residual_adapters.pt"

@@ -19,6 +19,7 @@ from vllm.model_executor.kernels.residual_tree_union import (
 )
 from vllm.model_executor.kernels.residual_tree_ordered import (
     fused_ordered_distinct_top1,
+    fused_ordered_head_top1,
     supports_fused_ordered_selection,
 )
 
@@ -216,6 +217,8 @@ class ResidualTreeHeadMixin:
                 }
                 else "distinct_head_top1"
             )
+        elif serving_proposal_mode == "raw_head_distribution":
+            self.residual_tree_required_candidate_selection = "head_top1"
 
         hidden_size = int(config.get("hidden_size", self.config.hidden_size))
         if hidden_size != int(self.config.hidden_size):
@@ -2002,7 +2005,7 @@ class ResidualTreeHeadMixin:
         *,
         first_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Select one conditioned token from every independent ordered head."""
+        """Select one token from every independent ordered head."""
 
         draft_vocab_size = self.residual_tree_draft_vocab_size
         target_vocab_size = int(getattr(self.config, "vocab_size", draft_vocab_size))
@@ -2057,6 +2060,10 @@ class ResidualTreeHeadMixin:
             self._residual_tree_cached_draft_target_ids = target_ids
             self._residual_tree_cached_draft_mapping_version = mapping_version
 
+        independent_head_top1 = (
+            getattr(self, "residual_tree_required_candidate_selection", None)
+            == "head_top1"
+        )
         if not getattr(self, "_residual_tree_fused_ordered_heads", True):
             selected_draft_tokens: list[torch.Tensor] = []
             selected_target_tokens: list[torch.Tensor] = []
@@ -2078,7 +2085,7 @@ class ResidualTreeHeadMixin:
                         f"ordered H{head_index + 1} output does not match H1 logits"
                     )
                 conditioned_logits = logits.float()
-                if selected_draft_tokens:
+                if selected_draft_tokens and not independent_head_top1:
                     blocked = torch.stack(selected_draft_tokens, dim=1)
                     conditioned_logits.scatter_(1, blocked, float("-inf"))
                 log_probabilities = torch.log_softmax(conditioned_logits, dim=1)
@@ -2161,38 +2168,44 @@ class ResidualTreeHeadMixin:
         if getattr(self, "_residual_tree_fused_ordered_selection", False) and (
             supports_fused_ordered_selection(first_logits, later_logits)
         ):
-            selected_draft_token_tensor, selected_probabilities = (
-                fused_ordered_distinct_top1(first_logits, later_logits)
-            )
+            if independent_head_top1:
+                selected_draft_token_tensor, selected_probabilities = (
+                    fused_ordered_head_top1(first_logits, later_logits)
+                )
+            else:
+                selected_draft_token_tensor, selected_probabilities = (
+                    fused_ordered_distinct_top1(first_logits, later_logits)
+                )
             selected_target_tokens = target_ids.index_select(
                 0, selected_draft_token_tensor.reshape(-1)
             ).reshape(selected_draft_token_tensor.shape)
             return selected_target_tokens, selected_probabilities
 
-        # The reference path normalized each head separately before argmax.
-        # Log-softmax preserves the logit ordering, so select the same ordered
-        # distinct tokens first, then normalize all already-conditioned rows in
-        # one launch.  This is bitwise equal to the reference on the supported
-        # BF16 CUDA path while eliminating nine full-vocabulary normalizers.
+        # Normalize every complete head row together. Independent heads keep
+        # their native distribution; conditioned heads mask prior winners.
         conditioned_logits = torch.cat(
             (first_logits.unsqueeze(1), later_logits), dim=1
         ).float()
-        selected_draft_tokens: list[torch.Tensor] = []
-        for head_index in range(self.residual_tree_total_heads):
-            draft_token = torch.argmax(
-                conditioned_logits[:, head_index], dim=1
+        if independent_head_top1:
+            selected_draft_token_tensor = torch.argmax(
+                conditioned_logits, dim=2
             )
-            selected_draft_tokens.append(draft_token)
-            if head_index + 1 < self.residual_tree_total_heads:
-                later_rows = conditioned_logits[:, head_index + 1 :]
-                blocked = draft_token[:, None, None].expand(
-                    -1, later_rows.shape[1], 1
+        else:
+            selected_draft_tokens: list[torch.Tensor] = []
+            for head_index in range(self.residual_tree_total_heads):
+                draft_token = torch.argmax(
+                    conditioned_logits[:, head_index], dim=1
                 )
-                later_rows.scatter_(2, blocked, float("-inf"))
-
-        selected_draft_token_tensor = torch.stack(
-            selected_draft_tokens, dim=1
-        )
+                selected_draft_tokens.append(draft_token)
+                if head_index + 1 < self.residual_tree_total_heads:
+                    later_rows = conditioned_logits[:, head_index + 1 :]
+                    blocked = draft_token[:, None, None].expand(
+                        -1, later_rows.shape[1], 1
+                    )
+                    later_rows.scatter_(2, blocked, float("-inf"))
+            selected_draft_token_tensor = torch.stack(
+                selected_draft_tokens, dim=1
+            )
         log_probabilities = torch.log_softmax(conditioned_logits, dim=2)
         selected_probabilities = torch.exp(
             log_probabilities.gather(

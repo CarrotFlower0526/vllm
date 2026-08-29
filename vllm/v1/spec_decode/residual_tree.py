@@ -1486,6 +1486,9 @@ def select_batched_eagle3_dynamic_trees(
     diagnostic_target_paths: Sequence[Sequence[int]] | None = None,
     frontier_h2_only_quota: int = 0,
     preserve_spine_count: int = 0,
+    candidate_selection: Literal[
+        "head_top1", "distinct_head_top1"
+    ] = "distinct_head_top1",
 ) -> list[ResidualTree]:
     """Build the released EAGLE-3 width-10, globally pruned tree.
 
@@ -1518,6 +1521,8 @@ def select_batched_eagle3_dynamic_trees(
         raise ValueError("dynamic H2-only frontier quota requires union provenance")
     if preserve_spine_count * max_depth > node_budget:
         raise ValueError("preserved dynamic spines do not fit the node budget")
+    if candidate_selection not in {"head_top1", "distinct_head_top1"}:
+        raise ValueError("unsupported dynamic candidate selection")
     if diagnostic_target_paths is not None:
         if not collect_dynamic_provenance:
             raise ValueError(
@@ -1639,7 +1644,10 @@ def select_batched_eagle3_dynamic_trees(
                 float(value)
                 for value in packet_row[candidate_width : 2 * candidate_width]
             ]
-            if len(set(token_row)) != candidate_width:
+            if (
+                candidate_selection == "distinct_head_top1"
+                and len(set(token_row)) != candidate_width
+            ):
                 raise ValueError(
                     "dynamic EAGLE-3 candidates must be distinct within a state"
                 )
@@ -1827,12 +1835,12 @@ def select_batched_eagle3_dynamic_trees(
                     "dynamic EAGLE-3 parent candidates were recorded twice"
                 )
             candidate_rows[parent_id] = row
+        contributors_by_token: dict[int, list[TreeCandidateContributor]] = {}
         for head_id, (token_id, probability) in enumerate(
             zip(token_row, probability_row, strict=True)
         ):
             lambda_weight = child_depth_lambdas[head_id]
             priority = parent.priority * lambda_weight * probability
-            node_id = len(nodes)
             contributor = TreeCandidateContributor(
                 head_id=head_id,
                 proposal_row=-1,
@@ -1841,6 +1849,11 @@ def select_batched_eagle3_dynamic_trees(
                 lambda_weight=lambda_weight,
                 score=priority,
             )
+            contributors_by_token.setdefault(token_id, []).append(contributor)
+
+        for token_id, contributors in contributors_by_token.items():
+            node_id = len(nodes)
+            priority = sum(contributor.score for contributor in contributors)
             nodes.append(
                 ResidualTreeNode(
                     node_id=node_id,
@@ -1848,7 +1861,7 @@ def select_batched_eagle3_dynamic_trees(
                     token_id=token_id,
                     depth=parent.depth + 1,
                     priority=priority,
-                    contributors=(contributor,),
+                    contributors=tuple(contributors),
                 )
             )
             children.append([])
@@ -1856,6 +1869,11 @@ def select_batched_eagle3_dynamic_trees(
             states.append(None)
             child_ids.append(node_id)
             if source_masks is not None:
+                if len(contributors) != 1:
+                    raise ValueError(
+                        "dynamic union provenance requires distinct candidates"
+                    )
+                head_id = contributors[0].head_id
                 assert h1_ranks is not None
                 assert h2_ranks is not None
                 assert score_heads is not None
@@ -2071,7 +2089,10 @@ def select_batched_eagle3_dynamic_trees(
     trees: list[ResidualTree] = []
     for builder_index, builder in enumerate(builders):
         generated_nodes: list[ResidualTreeNode] = builder["nodes"]
-        if len(generated_nodes) - 1 < node_budget:
+        if (
+            candidate_selection == "distinct_head_top1"
+            and len(generated_nodes) - 1 < node_budget
+        ):
             raise RuntimeError(
                 "dynamic EAGLE-3 candidate pool cannot fill the node budget"
             )
@@ -2079,24 +2100,25 @@ def select_batched_eagle3_dynamic_trees(
             range(1, len(generated_nodes)),
             key=lambda node_id: (-generated_nodes[node_id].priority, node_id),
         )
+        effective_node_budget = min(node_budget, len(global_priority_order))
         if preserve_spine_count:
             forced_ids = {
                 node_id for spine in builder["preserved_spines"] for node_id in spine
             }
             selected_set = set(forced_ids)
             for full_id in global_priority_order:
-                if len(selected_set) >= node_budget:
+                if len(selected_set) >= effective_node_budget:
                     break
                 if full_id in selected_set:
                     continue
                 parent_id = generated_nodes[full_id].parent_id
                 if parent_id == 0 or parent_id in selected_set:
                     selected_set.add(full_id)
-            if len(selected_set) != node_budget:
+            if len(selected_set) != effective_node_budget:
                 raise RuntimeError("preserved-spine pruning could not fill the budget")
             selected_full_ids = sorted(selected_set)
         else:
-            selected_full_ids = sorted(global_priority_order[:node_budget])
+            selected_full_ids = sorted(global_priority_order[:effective_node_budget])
         selected_set = set(selected_full_ids)
         for full_id in selected_full_ids:
             parent_id = generated_nodes[full_id].parent_id
@@ -2146,7 +2168,7 @@ def select_batched_eagle3_dynamic_trees(
                     ordered[min(frontier_width, len(ordered)) - 1]
                 ].priority
             global_cutoff_priority = generated_nodes[
-                global_priority_order[node_budget - 1]
+                global_priority_order[effective_node_budget - 1]
             ].priority
             retained_token_ids: list[int] = []
             retained_nodes: list[dict[str, Any]] = []
@@ -2265,7 +2287,9 @@ def select_batched_eagle3_dynamic_trees(
             {full_id: local_id for local_id, full_id in enumerate(selected_full_ids, 1)}
         )
         nodes = [ResidualTreeNode(0, -1, -1, 0, 1.0)]
-        children: list[list[int]] = [[] for _ in range(node_budget + 1)]
+        children: list[list[int]] = [
+            [] for _ in range(len(selected_full_ids) + 1)
+        ]
         for full_id in selected_full_ids:
             source = generated_nodes[full_id]
             local_id = full_to_local[full_id]
