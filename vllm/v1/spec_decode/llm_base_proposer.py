@@ -906,9 +906,10 @@ class SpecDecodeBaseProposer:
                     "EAGLE-3 dynamic residual trees require D8 with a node "
                     "budget between 1 and 60"
                 )
-            if scorer_mode != "lambda_q":
+            if scorer_mode not in {"lambda_q", "failure_probability"}:
                 raise ValueError(
-                    "EAGLE-3 dynamic residual trees require lambda_q scoring"
+                    "EAGLE-3 dynamic residual trees require lambda_q or "
+                    "failure_probability scoring"
                 )
             if not batch_drafting:
                 raise ValueError(
@@ -1055,6 +1056,7 @@ class SpecDecodeBaseProposer:
                     collect_dynamic_provenance=trace_path is not None,
                     diagnostic_target_paths=diagnostic_target_paths,
                     candidate_selection=configured_candidate_selection,
+                    scorer_mode=scorer_mode,
                 )
             if diagnostic_target_metadata is not None:
                 for tree, metadata in zip(
@@ -2075,6 +2077,7 @@ class SpecDecodeBaseProposer:
         )
         if scorer_mode not in {
             "lambda_q",
+            "failure_probability",
             "uniform",
             "head_prior",
             "greedy_listwise",

@@ -180,6 +180,48 @@ def test_dynamic_depth_head_lambdas_change_only_existing_priority_weight() -> No
     assert calibrated_tree.nodes[1].contributors[0].lambda_weight == 1.0
 
 
+def test_dynamic_failure_probability_scores_ordered_distinct_heads() -> None:
+    common = {
+        "root_states": [0],
+        "root_candidate_tokens": torch.tensor([[11, 12, 13]]),
+        "root_candidate_probabilities": torch.tensor([[0.4, 0.39, 0.9]]),
+        "candidate_batch_fn": lambda states: _candidate_batch(states, width=3),
+        "transition_batch_fn": lambda states, token_ids: list(token_ids),
+        "head_lambdas": (1.0, 1.0, 1.0),
+        "node_budget": 1,
+        "max_depth": 1,
+        "candidate_selection": "distinct_head_top1",
+    }
+
+    raw = select_batched_eagle3_dynamic_trees(**common)[0]
+    failure = select_batched_eagle3_dynamic_trees(
+        **common, scorer_mode="failure_probability"
+    )[0]
+
+    assert raw.nodes[1].token_id == 13
+    assert failure.nodes[1].token_id == 11
+    assert failure.nodes[1].priority == pytest.approx(0.4)
+
+
+def test_dynamic_failure_probability_requires_conditioned_distinct_candidates() -> None:
+    with pytest.raises(
+        ValueError,
+        match="requires distinct_head_top1",
+    ):
+        select_batched_eagle3_dynamic_trees(
+            root_states=[0],
+            root_candidate_tokens=torch.tensor([[11, 12]]),
+            root_candidate_probabilities=torch.tensor([[0.4, 0.3]]),
+            candidate_batch_fn=lambda states: _candidate_batch(states, width=2),
+            transition_batch_fn=lambda states, token_ids: list(token_ids),
+            head_lambdas=(1.0, 1.0),
+            node_budget=1,
+            max_depth=1,
+            candidate_selection="head_top1",
+            scorer_mode="failure_probability",
+        )
+
+
 def test_dynamic_provenance_records_generated_frontier_and_final_counts() -> None:
     root_tokens, root_probabilities = _candidate_batch([0], width=2)
     trees = select_batched_eagle3_dynamic_trees(
@@ -198,6 +240,7 @@ def test_dynamic_provenance_records_generated_frontier_and_final_counts() -> Non
 
     assert tree.dynamic_provenance == {
         "candidate_width": 2,
+        "scorer_mode": "lambda_q",
         "frontier_width": 10,
         "frontier_h2_only_quota": 0,
         "preserve_spine_count": 0,

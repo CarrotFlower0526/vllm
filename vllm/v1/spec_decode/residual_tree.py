@@ -320,7 +320,13 @@ CandidateSelection = Literal[
     "gated_distinct_head_top1",
 ]
 TreePolicy = Literal["best_first", "breadth_first"]
-TreeScorerMode = Literal["lambda_q", "uniform", "head_prior", "greedy_listwise"]
+TreeScorerMode = Literal[
+    "lambda_q",
+    "failure_probability",
+    "uniform",
+    "head_prior",
+    "greedy_listwise",
+]
 _QueuedTreeCandidate = tuple[
     float,
     int,
@@ -460,7 +466,13 @@ def select_residual_tree(
         raise ValueError(f"unsupported candidate_selection: {candidate_selection}")
     if tree_policy not in ("best_first", "breadth_first"):
         raise ValueError(f"unsupported tree_policy: {tree_policy}")
-    if scorer_mode not in ("lambda_q", "uniform", "head_prior", "greedy_listwise"):
+    if scorer_mode not in (
+        "lambda_q",
+        "failure_probability",
+        "uniform",
+        "head_prior",
+        "greedy_listwise",
+    ):
         raise ValueError(f"unsupported scorer_mode: {scorer_mode}")
     if scorer_mode == "greedy_listwise" and listwise_scorer is None:
         raise ValueError("greedy_listwise scorer mode requires listwise_scorer")
@@ -637,7 +649,8 @@ def select_residual_tree(
                 depth=parent.depth + 1,
                 top_k=scorer_top_k,
             )
-            if scorer_mode != "lambda_q" or collect_scoring_records
+            if scorer_mode in {"uniform", "head_prior", "greedy_listwise"}
+            or collect_scoring_records
             else None
         )
         class_probabilities: tuple[float, ...] | None = None
@@ -647,6 +660,15 @@ def select_residual_tree(
                 * candidate.lambda_weight
                 * candidate.proposal_probability
                 for candidate in selected
+            )
+        elif scorer_mode == "failure_probability":
+            survival = 1.0
+            local_scores = []
+            for candidate in selected:
+                local_scores.append(survival * candidate.proposal_probability)
+                survival *= 1.0 - candidate.proposal_probability
+            candidate_priorities = tuple(
+                parent.priority * score for score in local_scores
             )
         else:
             assert features is not None
@@ -1489,6 +1511,7 @@ def select_batched_eagle3_dynamic_trees(
     candidate_selection: Literal[
         "head_top1", "distinct_head_top1"
     ] = "distinct_head_top1",
+    scorer_mode: Literal["lambda_q", "failure_probability"] = "lambda_q",
 ) -> list[ResidualTree]:
     """Build the released EAGLE-3 width-10, globally pruned tree.
 
@@ -1524,6 +1547,14 @@ def select_batched_eagle3_dynamic_trees(
         raise ValueError("preserved dynamic spines do not fit the node budget")
     if candidate_selection not in {"head_top1", "distinct_head_top1"}:
         raise ValueError("unsupported dynamic candidate selection")
+    if scorer_mode not in {"lambda_q", "failure_probability"}:
+        raise ValueError("unsupported dynamic scorer mode")
+    if scorer_mode == "failure_probability" and candidate_selection != (
+        "distinct_head_top1"
+    ):
+        raise ValueError(
+            "failure_probability scoring requires distinct_head_top1 candidates"
+        )
     if diagnostic_target_paths is not None:
         if not collect_dynamic_provenance:
             raise ValueError(
@@ -1837,11 +1868,17 @@ def select_batched_eagle3_dynamic_trees(
                 )
             candidate_rows[parent_id] = row
         contributors_by_token: dict[int, list[TreeCandidateContributor]] = {}
+        failure_survival = 1.0
         for head_id, (token_id, probability) in enumerate(
             zip(token_row, probability_row, strict=True)
         ):
             lambda_weight = child_depth_lambdas[head_id]
-            priority = parent.priority * lambda_weight * probability
+            if scorer_mode == "failure_probability":
+                local_score = failure_survival * probability
+                failure_survival *= 1.0 - probability
+            else:
+                local_score = lambda_weight * probability
+            priority = parent.priority * local_score
             contributor = TreeCandidateContributor(
                 head_id=head_id,
                 proposal_row=-1,
@@ -2018,11 +2055,7 @@ def select_batched_eagle3_dynamic_trees(
                         "head_id": head_id,
                         "token_id": token_id,
                         "proposal_probability": probability,
-                        "candidate_path_priority": (
-                            parent_path_priority
-                            * child_depth_lambdas[head_id]
-                            * probability
-                        ),
+                        "candidate_path_priority": 0.0,
                         "entered_full_node_id": entered_by_token.get(token_id),
                     }
                     if source_masks is not None:
@@ -2038,6 +2071,19 @@ def select_batched_eagle3_dynamic_trees(
                             }
                         )
                     candidates.append(candidate)
+                local_scores: list[float] = []
+                failure_survival = 1.0
+                for head_id, probability in enumerate(probability_row):
+                    local_scores.append(
+                        failure_survival * probability
+                        if scorer_mode == "failure_probability"
+                        else child_depth_lambdas[head_id] * probability
+                    )
+                    if scorer_mode == "failure_probability":
+                        failure_survival *= 1.0 - probability
+                    candidates[head_id]["candidate_path_priority"] = (
+                        parent_path_priority * local_scores[head_id]
+                    )
                 correct_head_id = next(
                     (
                         head_id
@@ -2063,9 +2109,7 @@ def select_batched_eagle3_dynamic_trees(
                     break
 
                 correct_probability = probability_row[correct_head_id]
-                parent_path_priority *= (
-                    child_depth_lambdas[correct_head_id] * correct_probability
-                )
+                parent_path_priority *= local_scores[correct_head_id]
                 parent_path_token_ids.append(target_token_id)
                 matching_child_id = entered_by_token.get(target_token_id)
                 matching_child_state = (
@@ -2372,6 +2416,7 @@ def select_batched_eagle3_dynamic_trees(
             ]
             dynamic_provenance = {
                 "candidate_width": candidate_width,
+                "scorer_mode": scorer_mode,
                 "frontier_width": frontier_width,
                 "frontier_h2_only_quota": frontier_h2_only_quota,
                 "preserve_spine_count": preserve_spine_count,

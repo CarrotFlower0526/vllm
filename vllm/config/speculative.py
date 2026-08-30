@@ -161,10 +161,16 @@ class SpeculativeConfig:
     """Batch branch transitions with a drafter-side topology mask. Disable only
     for scalar-reference debugging or numerical A/B comparisons."""
     residual_tree_scorer_mode: Literal[
-        "lambda_q", "uniform", "head_prior", "greedy_listwise"
+        "lambda_q",
+        "failure_probability",
+        "uniform",
+        "head_prior",
+        "greedy_listwise",
     ] = "lambda_q"
     """Tree-node scorer. ``lambda_q`` preserves the historical proposal score.
-    The other modes form one categorical distribution over the ordered head
+    ``failure_probability`` assigns ordered candidate i the local score
+    ``h_i * product_{j<i}(1-h_j)`` from conditioned head maxima. The remaining
+    modes form one categorical distribution over the ordered head
     candidates plus none-of-the-above and multiply only by parent path
     probability."""
     residual_tree_head_prior_probabilities: list[float] | None = None
@@ -1352,9 +1358,22 @@ class SpeculativeConfig:
                         "head_top1, distinct_head_top1, or a supported hybrid "
                         "candidate layout"
                     )
-                if self.residual_tree_scorer_mode != "lambda_q":
+                if self.residual_tree_scorer_mode not in {
+                    "lambda_q",
+                    "failure_probability",
+                }:
                     raise ValueError(
-                        "eagle3_dynamic residual trees require lambda_q scoring"
+                        "eagle3_dynamic residual trees require lambda_q or "
+                        "failure_probability scoring"
+                    )
+                if (
+                    self.residual_tree_scorer_mode == "failure_probability"
+                    and self.residual_tree_candidate_selection
+                    != "distinct_head_top1"
+                ):
+                    raise ValueError(
+                        "failure_probability scoring requires ordered distinct "
+                        "head candidates"
                     )
                 if not self.residual_tree_batch_drafting:
                     raise ValueError(
