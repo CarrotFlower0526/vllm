@@ -7,12 +7,14 @@ import json
 import math
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.kernels.residual_tree_union import (
     fused_hybrid_union_top10,
     supports_fused_hybrid_union,
@@ -2238,6 +2240,99 @@ class ResidualTreeHeadMixin:
 
         tokens, _ = self.compute_residual_greedy_candidates(hidden_states)
         return tokens
+
+
+class _FrozenSingleDeviceLMHead(nn.Module):
+    """Unquantized one-device LM head used by offline native observations."""
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(weight.detach().contiguous(), requires_grad=False)
+        self.quant_method = UnquantizedLinearMethod()
+
+
+class _FrozenSingleDeviceLogitsProcessor:
+    """Apply the same unquantized LM-head kernel as the one-device draft model."""
+
+    def __call__(
+        self,
+        lm_head: _FrozenSingleDeviceLMHead,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return lm_head.quant_method.apply(lm_head, hidden_states)
+
+
+class ResidualTreeCandidateObserver(ResidualTreeHeadMixin, nn.Module):
+    """Evaluate sealed hidden states through the native ordered-head path.
+
+    This lightweight model owns only the frozen H1 projection, token mapping,
+    and residual adapters.  Candidate construction itself remains
+    :meth:`ResidualTreeHeadMixin.compute_residual_greedy_candidates`, the same
+    function used by the online EAGLE proposer.  It is intended for a
+    one-device, batch-invariant observation job and does not load or rerun the
+    draft transformer.
+    """
+
+    def __init__(
+        self,
+        *,
+        h1_weight: torch.Tensor,
+        draft_target_ids: torch.Tensor,
+        adapter_config: str | Path,
+        adapter_checkpoint: str | Path,
+    ) -> None:
+        nn.Module.__init__(self)
+        if h1_weight.ndim != 2 or not h1_weight.dtype.is_floating_point:
+            raise ValueError("candidate observer H1 weight must be a floating matrix")
+        draft_vocab_size, hidden_size = map(int, h1_weight.shape)
+        if not (
+            draft_target_ids.dtype == torch.int64
+            and tuple(draft_target_ids.shape) == (draft_vocab_size,)
+        ):
+            raise ValueError("candidate observer draft-to-target mapping differs")
+        if draft_vocab_size < 10 or hidden_size <= 0:
+            raise ValueError("candidate observer model dimensions differ")
+        sorted_target_ids = torch.sort(draft_target_ids).values
+        if bool((draft_target_ids < 0).any()) or bool(
+            (sorted_target_ids[1:] == sorted_target_ids[:-1]).any()
+        ):
+            raise ValueError("candidate observer requires an injective token mapping")
+
+        self.config = SimpleNamespace(
+            hidden_size=hidden_size,
+            draft_vocab_size=draft_vocab_size,
+            vocab_size=max(draft_vocab_size, int(draft_target_ids.max()) + 1),
+        )
+        self.lm_head = _FrozenSingleDeviceLMHead(h1_weight)
+        self.logits_processor = _FrozenSingleDeviceLogitsProcessor()
+        draft_ids = torch.arange(draft_vocab_size, dtype=torch.int64)
+        self.draft_id_to_target_id = nn.Parameter(
+            draft_target_ids.detach().cpu().contiguous() - draft_ids,
+            requires_grad=False,
+        )
+        spec_config = SimpleNamespace(
+            residual_tree_adapter_config=str(adapter_config),
+            residual_tree_adapter_checkpoint=str(adapter_checkpoint),
+            residual_tree_candidate_selection="distinct_head_top1",
+            residual_tree_head_lambdas=[1.0] * 10,
+            draft_model_config=SimpleNamespace(dtype=h1_weight.dtype),
+        )
+        self._init_residual_tree_heads(
+            SimpleNamespace(
+                speculative_config=spec_config,
+                model_config=SimpleNamespace(dtype=h1_weight.dtype),
+            )
+        )
+        if not (
+            self.residual_tree_total_heads == 10
+            and self.residual_tree_freeze_base_head
+            and self.residual_tree_adapter_output_mode == "logit_residual"
+            and self.residual_tree_required_candidate_selection
+            == "distinct_head_top1"
+            and self._residual_tree_packed_logit_in_weight is not None
+            and self._residual_tree_packed_logit_out_weight is not None
+        ):
+            raise ValueError("candidate observer adapter is not the native H1-H10 path")
 
 
 def _load_residual_tree_adapter_config(path: str | Path) -> dict[str, Any]:

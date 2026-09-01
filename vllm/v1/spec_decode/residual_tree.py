@@ -312,6 +312,9 @@ CompactCandidateBatchOutput = (
     ]
 )
 CompactCandidateBatchFn = Callable[[Sequence[Any]], CompactCandidateBatchOutput]
+CandidateRankingBatchFn = Callable[
+    [Sequence[Any], torch.Tensor, torch.Tensor], torch.Tensor
+]
 ListwiseScorerFn = Callable[[TreeListwiseFeatures], Sequence[float]]
 ChildOrder = Literal["head_id", "priority", "node_id", "random"]
 CandidateSelection = Literal[
@@ -323,6 +326,8 @@ TreePolicy = Literal["best_first", "breadth_first"]
 TreeScorerMode = Literal[
     "lambda_q",
     "failure_probability",
+    "calibrated_chain",
+    "same_candidate_oracle",
     "uniform",
     "head_prior",
     "greedy_listwise",
@@ -1491,6 +1496,7 @@ def select_batched_eagle3_dynamic_trees(
     root_candidate_tokens: torch.Tensor,
     root_candidate_probabilities: torch.Tensor,
     candidate_batch_fn: CompactCandidateBatchFn,
+    candidate_ranking_batch_fn: CandidateRankingBatchFn | None = None,
     transition_batch_fn: TransitionBatchFn,
     head_lambdas: torch.Tensor | Sequence[float],
     depth_head_lambdas: torch.Tensor | Sequence[Sequence[float]] | None = None,
@@ -1511,7 +1517,12 @@ def select_batched_eagle3_dynamic_trees(
     candidate_selection: Literal[
         "head_top1", "distinct_head_top1"
     ] = "distinct_head_top1",
-    scorer_mode: Literal["lambda_q", "failure_probability"] = "lambda_q",
+    scorer_mode: Literal[
+        "lambda_q",
+        "failure_probability",
+        "calibrated_chain",
+        "same_candidate_oracle",
+    ] = "lambda_q",
 ) -> list[ResidualTree]:
     """Build the released EAGLE-3 width-10, globally pruned tree.
 
@@ -1547,13 +1558,23 @@ def select_batched_eagle3_dynamic_trees(
         raise ValueError("preserved dynamic spines do not fit the node budget")
     if candidate_selection not in {"head_top1", "distinct_head_top1"}:
         raise ValueError("unsupported dynamic candidate selection")
-    if scorer_mode not in {"lambda_q", "failure_probability"}:
+    if scorer_mode not in {
+        "lambda_q",
+        "failure_probability",
+        "calibrated_chain",
+        "same_candidate_oracle",
+    }:
         raise ValueError("unsupported dynamic scorer mode")
-    if scorer_mode == "failure_probability" and candidate_selection != (
-        "distinct_head_top1"
+    if scorer_mode != "lambda_q" and candidate_selection != "distinct_head_top1":
+        raise ValueError(
+            "ordered-chain scoring requires distinct_head_top1 candidates"
+        )
+    if (candidate_ranking_batch_fn is None) != (
+        scorer_mode not in {"calibrated_chain", "same_candidate_oracle"}
     ):
         raise ValueError(
-            "failure_probability scoring requires distinct_head_top1 candidates"
+            "calibrated/oracle scoring requires exactly one ranking-probability "
+            "callback"
         )
     if diagnostic_target_paths is not None:
         if not collect_dynamic_provenance:
@@ -1625,6 +1646,7 @@ def select_batched_eagle3_dynamic_trees(
     def compact_rows(
         tokens: torch.Tensor,
         probabilities: torch.Tensor,
+        ranking_probabilities: torch.Tensor,
         expected_batch: int,
         provenance: tuple[
             torch.Tensor,
@@ -1637,6 +1659,7 @@ def select_batched_eagle3_dynamic_trees(
         tuple[
             list[int],
             list[float],
+            list[float],
             list[int] | None,
             list[int] | None,
             list[int] | None,
@@ -1646,6 +1669,7 @@ def select_batched_eagle3_dynamic_trees(
         if (
             tokens.ndim != 2
             or probabilities.shape != tokens.shape
+            or ranking_probabilities.shape != tokens.shape
             or tokens.shape != (expected_batch, candidate_width)
         ):
             raise ValueError(
@@ -1654,6 +1678,7 @@ def select_batched_eagle3_dynamic_trees(
         tensors = [
             tokens.to(dtype=torch.float64),
             probabilities.to(dtype=torch.float64),
+            ranking_probabilities.to(dtype=torch.float64),
         ]
         if provenance is not None:
             if not collect_dynamic_provenance:
@@ -1676,6 +1701,10 @@ def select_batched_eagle3_dynamic_trees(
                 float(value)
                 for value in packet_row[candidate_width : 2 * candidate_width]
             ]
+            ranking_probability_row = [
+                float(value)
+                for value in packet_row[2 * candidate_width : 3 * candidate_width]
+            ]
             if (
                 candidate_selection == "distinct_head_top1"
                 and len(set(token_row)) != candidate_width
@@ -1690,6 +1719,13 @@ def select_batched_eagle3_dynamic_trees(
                 raise ValueError(
                     "dynamic EAGLE-3 candidate probabilities must be in (0, 1]"
                 )
+            if any(
+                not math.isfinite(value) or value < 0.0 or value > 1.0
+                for value in ranking_probability_row
+            ):
+                raise ValueError(
+                    "dynamic EAGLE-3 ranking probabilities must be in [0, 1]"
+                )
             source_masks = h1_ranks = h2_ranks = score_heads = None
             if provenance is not None:
                 metadata_rows = [
@@ -1699,7 +1735,7 @@ def select_batched_eagle3_dynamic_trees(
                             column * candidate_width : (column + 1) * candidate_width
                         ]
                     ]
-                    for column in range(2, 6)
+                    for column in range(3, 7)
                 ]
                 source_masks, h1_ranks, h2_ranks, score_heads = metadata_rows
                 for index, (source_mask, h1_rank, h2_rank, score_head) in enumerate(
@@ -1735,6 +1771,7 @@ def select_batched_eagle3_dynamic_trees(
                 (
                     token_row,
                     probability_row,
+                    ranking_probability_row,
                     source_masks,
                     h1_ranks,
                     h2_ranks,
@@ -1748,6 +1785,7 @@ def select_batched_eagle3_dynamic_trees(
     ) -> list[
         tuple[
             list[int],
+            list[float],
             list[float],
             list[int] | None,
             list[int] | None,
@@ -1782,9 +1820,15 @@ def select_batched_eagle3_dynamic_trees(
             if len(projected) == 6
             else None
         )
+        ranking_probabilities = (
+            projected[1]
+            if candidate_ranking_batch_fn is None
+            else candidate_ranking_batch_fn(states, projected[0], projected[1])
+        )
         return compact_rows(
             projected[0],
             projected[1],
+            ranking_probabilities,
             len(states),
             projected_provenance,
         )
@@ -1847,6 +1891,7 @@ def select_batched_eagle3_dynamic_trees(
         row: tuple[
             list[int],
             list[float],
+            list[float],
             list[int] | None,
             list[int] | None,
             list[int] | None,
@@ -1859,7 +1904,15 @@ def select_batched_eagle3_dynamic_trees(
         parent = nodes[parent_id]
         child_depth_lambdas = depth_lambda_values[parent.depth]
         child_ids = []
-        token_row, probability_row, source_masks, h1_ranks, h2_ranks, score_heads = row
+        (
+            token_row,
+            probability_row,
+            ranking_probability_row,
+            source_masks,
+            h1_ranks,
+            h2_ranks,
+            score_heads,
+        ) = row
         if collect_dynamic_provenance:
             candidate_rows = builder["candidate_rows"]
             if parent_id in candidate_rows:
@@ -1869,15 +1922,19 @@ def select_batched_eagle3_dynamic_trees(
             candidate_rows[parent_id] = row
         contributors_by_token: dict[int, list[TreeCandidateContributor]] = {}
         failure_survival = 1.0
-        for head_id, (token_id, probability) in enumerate(
-            zip(token_row, probability_row, strict=True)
+        for head_id, (token_id, probability, ranking_probability) in enumerate(
+            zip(token_row, probability_row, ranking_probability_row, strict=True)
         ):
             lambda_weight = child_depth_lambdas[head_id]
-            if scorer_mode == "failure_probability":
-                local_score = failure_survival * probability
-                failure_survival *= 1.0 - probability
+            if scorer_mode in {
+                "failure_probability",
+                "calibrated_chain",
+                "same_candidate_oracle",
+            }:
+                local_score = failure_survival * ranking_probability
+                failure_survival *= 1.0 - ranking_probability
             else:
-                local_score = lambda_weight * probability
+                local_score = lambda_weight * ranking_probability
             priority = parent.priority * local_score
             contributor = TreeCandidateContributor(
                 head_id=head_id,
@@ -1926,6 +1983,15 @@ def select_batched_eagle3_dynamic_trees(
     root_rows = compact_rows(
         root_candidate_tokens,
         root_candidate_probabilities,
+        (
+            root_candidate_probabilities
+            if candidate_ranking_batch_fn is None
+            else candidate_ranking_batch_fn(
+                root_states,
+                root_candidate_tokens,
+                root_candidate_probabilities,
+            )
+        ),
         len(root_states),
         root_candidate_provenance,
     )
@@ -2035,6 +2101,7 @@ def select_batched_eagle3_dynamic_trees(
                 (
                     token_row,
                     probability_row,
+                    ranking_probability_row,
                     source_masks,
                     h1_ranks,
                     h2_ranks,
@@ -2048,8 +2115,13 @@ def select_batched_eagle3_dynamic_trees(
                         for child_id in builder["children"][parent_full_node_id]
                     }
                 candidates = []
-                for head_id, (token_id, probability) in enumerate(
-                    zip(token_row, probability_row, strict=True)
+                for head_id, (token_id, probability, ranking_probability) in enumerate(
+                    zip(
+                        token_row,
+                        probability_row,
+                        ranking_probability_row,
+                        strict=True,
+                    )
                 ):
                     candidate = {
                         "head_id": head_id,
@@ -2073,13 +2145,22 @@ def select_batched_eagle3_dynamic_trees(
                     candidates.append(candidate)
                 local_scores: list[float] = []
                 failure_survival = 1.0
-                for head_id, probability in enumerate(probability_row):
+                for head_id, probability in enumerate(ranking_probability_row):
                     local_scores.append(
                         failure_survival * probability
-                        if scorer_mode == "failure_probability"
+                        if scorer_mode
+                        in {
+                            "failure_probability",
+                            "calibrated_chain",
+                            "same_candidate_oracle",
+                        }
                         else child_depth_lambdas[head_id] * probability
                     )
-                    if scorer_mode == "failure_probability":
+                    if scorer_mode in {
+                        "failure_probability",
+                        "calibrated_chain",
+                        "same_candidate_oracle",
+                    }:
                         failure_survival *= 1.0 - probability
                     candidates[head_id]["candidate_path_priority"] = (
                         parent_path_priority * local_scores[head_id]

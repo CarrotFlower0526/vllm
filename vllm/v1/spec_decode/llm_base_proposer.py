@@ -53,6 +53,9 @@ from vllm.v1.spec_decode.residual_tree import (
     select_residual_tree,
     tree_to_draft_token_tree,
 )
+from vllm.v1.spec_decode.residual_tree_calibration import (
+    OrderedHeadIsotonicCalibration,
+)
 from vllm.v1.spec_decode.residual_tree_trace import (
     ROOT_VERIFIER_PROB_TRACE_ENV,
     TRAINING_FEATURE_TRACE_ENV,
@@ -397,6 +400,8 @@ class SpecDecodeBaseProposer:
         self._residual_tree_kv_caches: tuple[torch.Tensor, ...] = ()
         self._residual_tree_greedy_scorer: Any | None = None
         self._residual_tree_greedy_scorer_path: str | None = None
+        self._residual_tree_calibration: OrderedHeadIsotonicCalibration | None = None
+        self._residual_tree_calibration_path: str | None = None
         self._residual_tree_trace_step = 0
         self._residual_tree_training_feature_dir = os.environ.get(
             TRAINING_FEATURE_TRACE_ENV
@@ -906,10 +911,15 @@ class SpecDecodeBaseProposer:
                     "EAGLE-3 dynamic residual trees require D8 with a node "
                     "budget between 1 and 60"
                 )
-            if scorer_mode not in {"lambda_q", "failure_probability"}:
+            if scorer_mode not in {
+                "lambda_q",
+                "failure_probability",
+                "calibrated_chain",
+                "same_candidate_oracle",
+            }:
                 raise ValueError(
-                    "EAGLE-3 dynamic residual trees require lambda_q or "
-                    "failure_probability scoring"
+                    "EAGLE-3 dynamic residual trees require lambda_q or an "
+                    "ordered-chain scorer"
                 )
             if not batch_drafting:
                 raise ValueError(
@@ -933,6 +943,11 @@ class SpecDecodeBaseProposer:
                 canonical_replay is not None
                 and canonical_replay.tree_construction_oracle_batch()
             )
+            if tree_oracle_enabled != (scorer_mode == "same_candidate_oracle"):
+                raise ValueError(
+                    "same_candidate_oracle and canonical tree truth must be enabled "
+                    "together"
+                )
 
             def tree_oracle_targets(
                 states: Sequence[_ResidualTreeDraftState],
@@ -976,26 +991,31 @@ class SpecDecodeBaseProposer:
             def candidate_batch_fn(
                 states: Sequence[_ResidualTreeDraftState],
             ) -> tuple[torch.Tensor, torch.Tensor]:
-                tokens, probabilities = self._residual_tree_greedy_candidates_batch(
+                return self._residual_tree_greedy_candidates_batch(
                     residual_model,
                     states,
                 )
+
+            calibration = (
+                self._load_residual_tree_calibration()
+                if scorer_mode == "calibrated_chain"
+                else None
+            )
+
+            def candidate_ranking_batch_fn(
+                states: Sequence[_ResidualTreeDraftState],
+                tokens: torch.Tensor,
+                probabilities: torch.Tensor,
+            ) -> torch.Tensor:
+                if calibration is not None:
+                    return calibration(probabilities)
                 target_ids = tree_oracle_targets(states)
                 if target_ids is None:
-                    return tokens, probabilities
-                target_mask = target_ids[:, None].ge(0) & tokens.eq(
-                    target_ids[:, None]
-                )
-                below_one = torch.nextafter(
-                    torch.ones((), dtype=probabilities.dtype, device=probabilities.device),
-                    torch.zeros((), dtype=probabilities.dtype, device=probabilities.device),
-                )
-                promoted = torch.where(
-                    target_mask,
-                    torch.ones_like(probabilities),
-                    probabilities.clamp_max(below_one),
-                )
-                return tokens, promoted
+                    raise AssertionError("oracle ranking lacks canonical target truth")
+                return (
+                    target_ids[:, None].ge(0)
+                    & tokens.eq(target_ids[:, None])
+                ).to(probabilities.dtype)
 
             root_candidates = candidate_batch_fn(root_states)
             diagnostic_target_paths = None
@@ -1041,6 +1061,12 @@ class SpecDecodeBaseProposer:
                     root_candidate_tokens=root_candidates[0],
                     root_candidate_probabilities=root_candidates[1],
                     candidate_batch_fn=candidate_batch_fn,
+                    candidate_ranking_batch_fn=(
+                        candidate_ranking_batch_fn
+                        if scorer_mode
+                        in {"calibrated_chain", "same_candidate_oracle"}
+                        else None
+                    ),
                     transition_batch_fn=lambda states, token_ids: (
                         self._residual_tree_transition_batch(
                             residual_model,
@@ -1988,6 +2014,21 @@ class SpecDecodeBaseProposer:
         self._residual_tree_greedy_scorer_path = normalized_path
         return scorer
 
+    def _load_residual_tree_calibration(self) -> OrderedHeadIsotonicCalibration:
+        path = getattr(self.speculative_config, "residual_tree_calibration_path", None)
+        if not path:
+            raise ValueError("calibrated_chain requires a frozen calibration path")
+        normalized_path = str(path)
+        if (
+            self._residual_tree_calibration is not None
+            and self._residual_tree_calibration_path == normalized_path
+        ):
+            return self._residual_tree_calibration
+        calibration = OrderedHeadIsotonicCalibration(normalized_path)
+        self._residual_tree_calibration = calibration
+        self._residual_tree_calibration_path = normalized_path
+        return calibration
+
     def set_residual_tree_runtime_config(
         self,
         config: dict[str, Any] | None,
@@ -2078,6 +2119,8 @@ class SpecDecodeBaseProposer:
         if scorer_mode not in {
             "lambda_q",
             "failure_probability",
+            "calibrated_chain",
+            "same_candidate_oracle",
             "uniform",
             "head_prior",
             "greedy_listwise",

@@ -7,7 +7,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm.model_executor.models.eagle_residual import ResidualTreeHeadMixin
+from vllm.model_executor.models.eagle_residual import (
+    ResidualTreeCandidateObserver,
+    ResidualTreeHeadMixin,
+)
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.spec_decode.llm_base_proposer import (
     _build_greedy_b2d1_draft_trees,
@@ -320,6 +323,70 @@ def test_fused_ordered_low_rank_heads_match_reference() -> None:
 
     assert torch.equal(fused_tokens, reference_tokens)
     assert torch.equal(fused_probabilities, reference_probabilities)
+
+
+def test_native_candidate_observer_uses_packed_online_path_across_frontier_shapes(
+    tmp_path,
+) -> None:
+    config_path = tmp_path / "adapter_config.json"
+    checkpoint_path = tmp_path / "residual_adapters.pt"
+    config_path.write_text(
+        """{
+  "method": "vllm_eagle3_shared_trunk_residual_heads",
+  "hidden_size": 4,
+  "adapter_bottleneck": 1,
+  "adapter_depth": 2,
+  "adapter_output_mode": "logit_residual",
+  "adapter_activation": "identity",
+  "draft_vocab_size": 12,
+  "num_residual_adapters": 9,
+  "num_layers": 10,
+  "freeze_base_head": true,
+  "serving_proposal_mode": "condition_on_prior_selected_tokens"
+}""",
+        encoding="utf-8",
+    )
+    state = {}
+    for adapter_index in range(9):
+        low_rank_in = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        low_rank_out = torch.zeros((12, 1))
+        low_rank_out[adapter_index + 1, 0] = 20.0
+        state[f"{adapter_index}.0.weight"] = low_rank_in
+        state[f"{adapter_index}.2.weight"] = low_rank_out
+    torch.save(state, checkpoint_path)
+    h1_weight = torch.zeros((12, 4))
+    h1_weight[0, 0] = 10.0
+    draft_target_ids = torch.arange(12, dtype=torch.int64) * 2
+    observer = ResidualTreeCandidateObserver(
+        h1_weight=h1_weight,
+        draft_target_ids=draft_target_ids,
+        adapter_config=config_path,
+        adapter_checkpoint=checkpoint_path,
+    )
+    assert (
+        observer.compute_residual_greedy_candidates.__func__
+        is ResidualTreeHeadMixin.compute_residual_greedy_candidates
+    )
+    hidden_states = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0]]
+    )
+
+    batched_tokens, batched_probabilities = (
+        observer.compute_residual_greedy_candidates(hidden_states)
+    )
+    single = [
+        observer.compute_residual_greedy_candidates(hidden_states[index : index + 1])
+        for index in range(2)
+    ]
+
+    assert observer._residual_tree_packed_logit_in_weight is not None
+    assert observer._residual_tree_packed_logit_out_weight is not None
+    assert torch.equal(batched_tokens, torch.cat([row[0] for row in single]))
+    assert torch.equal(
+        batched_probabilities,
+        torch.cat([row[1] for row in single]),
+    )
+    assert batched_tokens[0].tolist() == [value * 2 for value in range(10)]
 
 
 def test_stock_top2_projects_h1_once_without_adapter_or_fp32(

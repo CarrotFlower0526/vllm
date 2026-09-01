@@ -163,13 +163,18 @@ class SpeculativeConfig:
     residual_tree_scorer_mode: Literal[
         "lambda_q",
         "failure_probability",
+        "calibrated_chain",
+        "same_candidate_oracle",
         "uniform",
         "head_prior",
         "greedy_listwise",
     ] = "lambda_q"
     """Tree-node scorer. ``lambda_q`` preserves the historical proposal score.
     ``failure_probability`` assigns ordered candidate i the local score
-    ``h_i * product_{j<i}(1-h_j)`` from conditioned head maxima. The remaining
+    ``h_i * product_{j<i}(1-h_j)`` from conditioned head maxima.
+    ``calibrated_chain`` first applies one frozen monotone map to each ``h_i``.
+    ``same_candidate_oracle`` uses candidate-hit truth only as a non-deployable
+    ranking upper bound. The remaining
     modes form one categorical distribution over the ordered head
     candidates plus none-of-the-above and multiply only by parent path
     probability."""
@@ -177,6 +182,8 @@ class SpeculativeConfig:
     """Candidate-head probabilities followed by none for ``head_prior``."""
     residual_tree_greedy_scorer_path: str | None = None
     """Serialized serving-only listwise scorer for ``greedy_listwise``."""
+    residual_tree_calibration_path: str | None = None
+    """Frozen H1--H10 isotonic maps used only by ``calibrated_chain``."""
     residual_tree_scorer_top_k: int = Field(default=10, ge=1)
     """Top-k mass feature width. Must match the serialized scorer schema."""
     residual_tree_trace_path: str | None = None
@@ -1361,18 +1368,25 @@ class SpeculativeConfig:
                 if self.residual_tree_scorer_mode not in {
                     "lambda_q",
                     "failure_probability",
+                    "calibrated_chain",
+                    "same_candidate_oracle",
                 }:
                     raise ValueError(
-                        "eagle3_dynamic residual trees require lambda_q or "
-                        "failure_probability scoring"
+                        "eagle3_dynamic residual trees require lambda_q or an "
+                        "ordered-chain scorer"
                     )
                 if (
-                    self.residual_tree_scorer_mode == "failure_probability"
+                    self.residual_tree_scorer_mode
+                    in {
+                        "failure_probability",
+                        "calibrated_chain",
+                        "same_candidate_oracle",
+                    }
                     and self.residual_tree_candidate_selection
                     != "distinct_head_top1"
                 ):
                     raise ValueError(
-                        "failure_probability scoring requires ordered distinct "
+                        "ordered-chain scoring requires ordered distinct "
                         "head candidates"
                     )
                 if not self.residual_tree_batch_drafting:
@@ -1481,6 +1495,13 @@ class SpeculativeConfig:
                 raise ValueError(
                     "residual_tree_greedy_scorer_path is only valid with the "
                     "greedy_listwise scorer"
+                )
+            if (
+                self.residual_tree_scorer_mode == "calibrated_chain"
+            ) != (self.residual_tree_calibration_path is not None):
+                raise ValueError(
+                    "calibrated_chain requires exactly one frozen "
+                    "residual_tree_calibration_path"
                 )
         elif self.residual_tree_candidate_selection in {
             "stock_top2",

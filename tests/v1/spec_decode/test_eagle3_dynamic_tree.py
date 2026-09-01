@@ -222,6 +222,68 @@ def test_dynamic_failure_probability_requires_conditioned_distinct_candidates() 
         )
 
 
+def test_dynamic_scorers_share_candidates_and_raw_proposal_probabilities() -> None:
+    original_tokens = torch.tensor([[11, 12, 13]])
+    original_probabilities = torch.tensor([[0.60, 0.59, 0.58]])
+    ranking_values = {
+        "calibrated_chain": torch.tensor([[0.10, 0.90, 0.00]]),
+        "same_candidate_oracle": torch.tensor([[0.00, 0.00, 1.00]]),
+    }
+    selected = {}
+
+    for scorer_mode in (
+        "lambda_q",
+        "failure_probability",
+        "calibrated_chain",
+        "same_candidate_oracle",
+    ):
+        candidate_tokens = original_tokens.clone()
+        candidate_probabilities = original_probabilities.clone()
+        seen = {}
+
+        def ranking(states, tokens, probabilities):
+            seen["tokens"] = tokens.clone()
+            seen["probabilities"] = probabilities.clone()
+            return ranking_values[scorer_mode].expand_as(probabilities)
+
+        tree = select_batched_eagle3_dynamic_trees(
+            root_states=[0],
+            root_candidate_tokens=candidate_tokens,
+            root_candidate_probabilities=candidate_probabilities,
+            candidate_batch_fn=lambda states: _candidate_batch(states, width=3),
+            candidate_ranking_batch_fn=(
+                ranking if scorer_mode in ranking_values else None
+            ),
+            transition_batch_fn=lambda states, token_ids: list(token_ids),
+            head_lambdas=(1.0, 1.0, 1.0),
+            node_budget=1,
+            max_depth=1,
+            candidate_selection="distinct_head_top1",
+            scorer_mode=scorer_mode,
+        )[0]
+
+        torch.testing.assert_close(candidate_tokens, original_tokens)
+        torch.testing.assert_close(candidate_probabilities, original_probabilities)
+        if scorer_mode in ranking_values:
+            torch.testing.assert_close(seen["tokens"], original_tokens)
+            torch.testing.assert_close(
+                seen["probabilities"], original_probabilities
+            )
+        node = tree.nodes[1]
+        raw_index = original_tokens[0].tolist().index(node.token_id)
+        assert node.contributors[0].proposal_prob == pytest.approx(
+            original_probabilities[0, raw_index].item()
+        )
+        selected[scorer_mode] = node.token_id
+
+    assert selected == {
+        "lambda_q": 11,
+        "failure_probability": 11,
+        "calibrated_chain": 12,
+        "same_candidate_oracle": 13,
+    }
+
+
 def test_dynamic_provenance_records_generated_frontier_and_final_counts() -> None:
     root_tokens, root_probabilities = _candidate_batch([0], width=2)
     trees = select_batched_eagle3_dynamic_trees(
