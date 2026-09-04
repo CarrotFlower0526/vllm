@@ -6,13 +6,14 @@ import math
 import os
 from collections.abc import Sequence
 from importlib.util import find_spec
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
+from vllm.config.speculative import ResidualTreeScorerMode
 from vllm.config import (
     CUDAGraphMode,
     VllmConfig,
@@ -2116,15 +2117,7 @@ class SpecDecodeBaseProposer:
             "scorer_mode",
             self.speculative_config.residual_tree_scorer_mode,
         )
-        if scorer_mode not in {
-            "lambda_q",
-            "failure_probability",
-            "calibrated_chain",
-            "same_candidate_oracle",
-            "uniform",
-            "head_prior",
-            "greedy_listwise",
-        }:
+        if scorer_mode not in get_args(ResidualTreeScorerMode):
             raise ValueError(f"unknown residual-tree runtime scorer: {scorer_mode}")
         normalized["scorer_mode"] = scorer_mode
 

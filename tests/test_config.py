@@ -392,6 +392,61 @@ def test_residual_tree_accepts_hybrid_union_candidate_selection(monkeypatch):
     assert config.residual_tree_candidate_selection == "hybrid_union_top10_dynamic"
 
 
+def test_residual_tree_serves_the_declared_runtime_scorer_modes(monkeypatch):
+    # One reused engine boots on lambda_q and is switched to the other two.
+    config = _validated_residual_tree_spec_config(
+        monkeypatch,
+        residual_tree_runtime_scorer_modes=[
+            "failure_probability",
+            "calibrated_chain",
+        ],
+        residual_tree_candidate_selection="distinct_head_top1",
+        residual_tree_calibration_path="/tmp/calibrator.json",
+    )
+
+    assert config.residual_tree_served_scorer_modes == (
+        "lambda_q",
+        "failure_probability",
+        "calibrated_chain",
+    )
+    assert _validated_residual_tree_spec_config(
+        monkeypatch
+    ).residual_tree_served_scorer_modes == ("lambda_q",)
+
+
+def test_calibration_path_follows_the_served_set_not_the_boot_mode(monkeypatch):
+    """The calibrator is loaded once, so its need is known only from the set.
+
+    A runtime switch can carry the head-prior probabilities and the greedy
+    scorer path it needs, so those stay the boot mode's business.  A calibration
+    mapping cannot be switched in, so an engine that will serve
+    ``calibrated_chain`` must be handed it while it is being built.
+    """
+
+    declared = {
+        "residual_tree_runtime_scorer_modes": ["calibrated_chain"],
+        "residual_tree_candidate_selection": "distinct_head_top1",
+    }
+
+    config = _validated_residual_tree_spec_config(
+        monkeypatch,
+        **declared,
+        residual_tree_calibration_path="/tmp/calibrator.json",
+    )
+    assert config.residual_tree_calibration_path == "/tmp/calibrator.json"
+
+    # Served without its mapping: refused before any weight loads.
+    with pytest.raises(ValidationError, match="supplied exactly"):
+        _validated_residual_tree_spec_config(monkeypatch, **declared)
+
+    # A mapping no served mode consumes stays a contradiction.
+    with pytest.raises(ValidationError, match="supplied exactly"):
+        _validated_residual_tree_spec_config(
+            monkeypatch,
+            residual_tree_calibration_path="/tmp/calibrator.json",
+        )
+
+
 @pytest.mark.parametrize(
     ("active_heads", "message"),
     [

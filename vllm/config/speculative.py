@@ -70,6 +70,15 @@ SpeculativeMethod = Literal[
 ]
 RejectionSampleMethod = Literal["standard", "synthetic"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
+ResidualTreeScorerMode = Literal[
+    "lambda_q",
+    "failure_probability",
+    "calibrated_chain",
+    "same_candidate_oracle",
+    "uniform",
+    "head_prior",
+    "greedy_listwise",
+]
 
 
 @config
@@ -160,15 +169,7 @@ class SpeculativeConfig:
     residual_tree_batch_drafting: bool = True
     """Batch branch transitions with a drafter-side topology mask. Disable only
     for scalar-reference debugging or numerical A/B comparisons."""
-    residual_tree_scorer_mode: Literal[
-        "lambda_q",
-        "failure_probability",
-        "calibrated_chain",
-        "same_candidate_oracle",
-        "uniform",
-        "head_prior",
-        "greedy_listwise",
-    ] = "lambda_q"
+    residual_tree_scorer_mode: ResidualTreeScorerMode = "lambda_q"
     """Tree-node scorer. ``lambda_q`` preserves the historical proposal score.
     ``failure_probability`` assigns ordered candidate i the local score
     ``h_i * product_{j<i}(1-h_j)`` from conditioned head maxima.
@@ -178,6 +179,15 @@ class SpeculativeConfig:
     modes form one categorical distribution over the ordered head
     candidates plus none-of-the-above and multiply only by parent path
     probability."""
+    residual_tree_runtime_scorer_modes: list[ResidualTreeScorerMode] | None = Field(
+        default=None, min_length=1
+    )
+    """Further scorer modes this engine will be switched to while it serves.
+
+    One engine can serve several scorers: ``set_residual_tree_runtime_config``
+    switches between them without reloading weights. Declaring them here is
+    what makes every per-mode resource checkable before the weights load, and
+    a switch to an undeclared mode is refused."""
     residual_tree_head_prior_probabilities: list[float] | None = None
     """Candidate-head probabilities followed by none for ``head_prior``."""
     residual_tree_greedy_scorer_path: str | None = None
@@ -1168,6 +1178,7 @@ class SpeculativeConfig:
             )
 
         if self.residual_tree:
+            served_scorer_modes = self.residual_tree_served_scorer_modes
             if self.method not in ("eagle", "eagle3", "mtp"):
                 raise ValueError(
                     "residual_tree is only supported with EAGLE/EAGLE3/MTP "
@@ -1257,8 +1268,11 @@ class SpeculativeConfig:
                         "stock_top2 must not load or configure residual heads: "
                         + ", ".join(supplied)
                     )
-                if self.residual_tree_scorer_mode != "lambda_q":
-                    raise ValueError("stock_top2 supports only lambda_q ordering")
+                if served_scorer_modes != ("lambda_q",):
+                    raise ValueError(
+                        "stock_top2 supports only lambda_q ordering, but this "
+                        f"engine serves {list(served_scorer_modes)}"
+                    )
                 if self.residual_tree_min_novel_probability_ratio != 0.0:
                     raise ValueError("stock_top2 does not use residual novelty gating")
                 if self.draft_sample_method != "greedy":
@@ -1321,9 +1335,11 @@ class SpeculativeConfig:
                         f"{candidate_selection} must not load or configure residual heads: "
                         + ", ".join(supplied)
                     )
-                if self.residual_tree_scorer_mode != "lambda_q":
+                if served_scorer_modes != ("lambda_q",):
                     raise ValueError(
-                        f"{candidate_selection} supports only lambda_q ordering"
+                        f"{candidate_selection} supports only lambda_q "
+                        f"ordering, but this engine serves "
+                        f"{list(served_scorer_modes)}"
                     )
                 if self.residual_tree_min_novel_probability_ratio != 0.0:
                     raise ValueError(
@@ -1365,29 +1381,38 @@ class SpeculativeConfig:
                         "head_top1, distinct_head_top1, or a supported hybrid "
                         "candidate layout"
                     )
-                if self.residual_tree_scorer_mode not in {
-                    "lambda_q",
-                    "failure_probability",
-                    "calibrated_chain",
-                    "same_candidate_oracle",
-                }:
-                    raise ValueError(
-                        "eagle3_dynamic residual trees require lambda_q or an "
-                        "ordered-chain scorer"
-                    )
-                if (
-                    self.residual_tree_scorer_mode
-                    in {
+                if any(
+                    mode
+                    not in {
+                        "lambda_q",
                         "failure_probability",
                         "calibrated_chain",
                         "same_candidate_oracle",
                     }
+                    for mode in served_scorer_modes
+                ):
+                    raise ValueError(
+                        "eagle3_dynamic residual trees require lambda_q or an "
+                        "ordered-chain scorer, but this engine serves "
+                        f"{list(served_scorer_modes)}"
+                    )
+                if (
+                    any(
+                        mode
+                        in {
+                            "failure_probability",
+                            "calibrated_chain",
+                            "same_candidate_oracle",
+                        }
+                        for mode in served_scorer_modes
+                    )
                     and self.residual_tree_candidate_selection
                     != "distinct_head_top1"
                 ):
                     raise ValueError(
                         "ordered-chain scoring requires ordered distinct "
-                        "head candidates"
+                        "head candidates, but this engine serves "
+                        f"{list(served_scorer_modes)}"
                     )
                 if not self.residual_tree_batch_drafting:
                     raise ValueError(
@@ -1425,12 +1450,13 @@ class SpeculativeConfig:
                     "not support synthetic rejection sampling."
                 )
             if (
-                self.residual_tree_scorer_mode != "lambda_q"
+                any(mode != "lambda_q" for mode in served_scorer_modes)
                 and self.residual_tree_candidate_selection != "distinct_head_top1"
             ):
                 raise ValueError(
                     "categorical residual-tree scorers require "
-                    "residual_tree_candidate_selection='distinct_head_top1'"
+                    "residual_tree_candidate_selection='distinct_head_top1', "
+                    f"but this engine serves {list(served_scorer_modes)}"
                 )
             if self.residual_tree_scorer_mode == "head_prior":
                 probabilities = self.residual_tree_head_prior_probabilities
@@ -1496,12 +1522,14 @@ class SpeculativeConfig:
                     "residual_tree_greedy_scorer_path is only valid with the "
                     "greedy_listwise scorer"
                 )
-            if (
-                self.residual_tree_scorer_mode == "calibrated_chain"
-            ) != (self.residual_tree_calibration_path is not None):
+            if ("calibrated_chain" in served_scorer_modes) != (
+                self.residual_tree_calibration_path is not None
+            ):
                 raise ValueError(
-                    "calibrated_chain requires exactly one frozen "
-                    "residual_tree_calibration_path"
+                    "residual_tree_calibration_path must be supplied exactly "
+                    "when calibrated_chain is served: this engine serves "
+                    f"{list(served_scorer_modes)} and received "
+                    f"{self.residual_tree_calibration_path!r}"
                 )
         elif self.residual_tree_candidate_selection in {
             "stock_top2",
@@ -1537,6 +1565,18 @@ class SpeculativeConfig:
                     f"Using models with different tokenizers can cause out-of-bounds "
                     f"errors during speculative decoding."
                 )
+
+    @property
+    def residual_tree_served_scorer_modes(self) -> tuple[str, ...]:
+        """Every scorer mode this engine can serve, initial mode first.
+
+        ``residual_tree_scorer_mode`` is always served: a runtime control that
+        omits ``scorer_mode`` keeps it. Declared runtime modes extend that set,
+        and nothing outside it is servable.
+        """
+        initial = self.residual_tree_scorer_mode
+        declared = self.residual_tree_runtime_scorer_modes or ()
+        return (initial, *(mode for mode in declared if mode != initial))
 
     @property
     def max_num_new_slots_for_drafting(self) -> int:
