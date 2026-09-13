@@ -108,6 +108,7 @@ class ResidualTreeHeadMixin:
     _residual_tree_fused_hybrid_union: bool
     _residual_tree_fused_ordered_heads: bool
     _residual_tree_fused_ordered_selection: bool
+    _residual_tree_batched_ordered_selection: bool
 
     def _init_residual_tree_heads(self, vllm_config: VllmConfig) -> None:
         spec_config = vllm_config.speculative_config
@@ -163,6 +164,9 @@ class ResidualTreeHeadMixin:
         ).lower() not in {"0", "false", "no"}
         self._residual_tree_fused_ordered_selection = os.environ.get(
             "VLLM_RESIDUAL_TREE_FUSED_ORDERED_SELECTION", "1"
+        ).lower() not in {"0", "false", "no"}
+        self._residual_tree_batched_ordered_selection = os.environ.get(
+            "VLLM_RESIDUAL_TREE_BATCHED_ORDERED_SELECTION", "1"
         ).lower() not in {"0", "false", "no"}
         if spec_config is None:
             return
@@ -2182,6 +2186,33 @@ class ResidualTreeHeadMixin:
                 0, selected_draft_token_tensor.reshape(-1)
             ).reshape(selected_draft_token_tensor.shape)
             return selected_target_tokens, selected_probabilities
+
+        if not getattr(self, "_residual_tree_batched_ordered_selection", True):
+            selected_draft_tokens: list[torch.Tensor] = []
+            selected_probabilities: list[torch.Tensor] = []
+            for head_logits in (first_logits, *later_logits.unbind(dim=1)):
+                conditioned_logits = head_logits.float()
+                if selected_draft_tokens and not independent_head_top1:
+                    conditioned_logits.scatter_(
+                        1,
+                        torch.stack(selected_draft_tokens, dim=1),
+                        float("-inf"),
+                    )
+                log_probabilities = torch.log_softmax(conditioned_logits, dim=1)
+                draft_token = torch.argmax(log_probabilities, dim=1)
+                selected_draft_tokens.append(draft_token)
+                selected_probabilities.append(
+                    torch.exp(
+                        log_probabilities.gather(
+                            1, draft_token.unsqueeze(1)
+                        ).squeeze(1)
+                    )
+                )
+            selected_draft_token_tensor = torch.stack(selected_draft_tokens, dim=1)
+            selected_target_tokens = target_ids.index_select(
+                0, selected_draft_token_tensor.reshape(-1)
+            ).reshape(selected_draft_token_tensor.shape)
+            return selected_target_tokens, torch.stack(selected_probabilities, dim=1)
 
         # Normalize every complete head row together. Independent heads keep
         # their native distribution; conditioned heads mask prior winners.
