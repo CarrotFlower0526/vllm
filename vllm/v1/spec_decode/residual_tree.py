@@ -1504,6 +1504,7 @@ def select_batched_eagle3_dynamic_trees(
     max_depth: int,
     frontier_width: int = 10,
     collect_dynamic_provenance: bool = False,
+    collect_dynamic_candidate_states: bool = False,
     root_candidate_provenance: tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1540,6 +1541,8 @@ def select_batched_eagle3_dynamic_trees(
 
     if not root_states:
         return []
+    if collect_dynamic_candidate_states and not collect_dynamic_provenance:
+        raise ValueError("dynamic candidate-state trace requires provenance collection")
     if node_budget <= 0:
         raise ValueError("dynamic EAGLE-3 node_budget must be positive")
     if max_depth <= 0:
@@ -2505,6 +2508,19 @@ def select_batched_eagle3_dynamic_trees(
                 "continued_frontier_by_depth": summarize(continued_full_ids),
                 "final_tree_by_depth": summarize(selected_full_ids),
             }
+            if collect_dynamic_candidate_states:
+                candidate_rows = builder["candidate_rows"]
+                dynamic_provenance["ordered_candidate_states"] = [
+                    {
+                        "parent_full_node_id": parent_id,
+                        "child_depth": generated_nodes[parent_id].depth + 1,
+                        "candidates": [
+                            {"head_id": head_id, "token_id": token_id}
+                            for head_id, token_id in enumerate(row[0])
+                        ],
+                    }
+                    for parent_id, row in candidate_rows.items()
+                ]
             if diagnostic_target_paths is not None:
                 dynamic_provenance["canonical_spine_candidate_schema"] = (
                     "ordered_distinct_heads_same_process_v1"
